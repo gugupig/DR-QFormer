@@ -1,0 +1,39 @@
+# DR-QFormer Configuration: QA Tasks
+# Minimal hyperparameters for question-answering
+
+model:
+  n_queries: 32              # Number of learnable query tokens (N)
+  hidden_dim: 768            # Hidden dimension (d)
+  num_layers: 6              # Number of Q-Former layers
+  num_heads: 8               # Attention heads per layer
+  dropout: 0.1               # Dropout rate
+  k_fragments: 10            # Max retrieved fragments (k)
+
+retriever:
+  model_name: "facebook/contriever"
+  freeze: true               # Always frozen
+
+llm:
+  model_name: "microsoft/phi-2"
+  freeze: true               # Always frozen
+  max_length: 256
+
+training:
+  lr: 1.0e-4                 # Learning rate
+  batch_size: 8              # Batch size
+  epochs: 10                 # Number of epochs
+  warmup_steps: 500
+  weight_decay: 0.01
+  grad_clip: 1.0
+  seed: 42
+
+data:
+  train_data: "data/train.json"
+  dev_data: "data/dev.json"
+  test_data: "data/test.json"
+
+output:
+  output_dir: "outputs/qa"
+  save_steps: 1000
+  eval_steps: 500
+  logging_steps: 100

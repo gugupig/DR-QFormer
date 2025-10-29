@@ -1,0 +1,42 @@
+# DR-QFormer Configuration: Question Generation Tasks
+# Minimal hyperparameters for QG/generation tasks
+
+model:
+  n_queries: 32              # Number of learnable query tokens (N)
+  hidden_dim: 768            # Hidden dimension (d)
+  num_layers: 6              # Number of Q-Former layers
+  num_heads: 8               # Attention heads per layer
+  dropout: 0.1               # Dropout rate
+  k_fragments: 10            # Max retrieved fragments (k)
+
+retriever:
+  model_name: "facebook/contriever"
+  freeze: true               # Always frozen
+
+llm:
+  model_name: "microsoft/phi-2"
+  freeze: true               # Always frozen
+  max_length: 512            # Longer for generation
+  temperature: 0.7
+  top_p: 0.9
+
+training:
+  lr: 5.0e-5                 # Slightly lower LR for generation
+  batch_size: 4              # Smaller batch for generation
+  epochs: 15                 # More epochs for generation quality
+  warmup_steps: 1000
+  weight_decay: 0.01
+  grad_clip: 1.0
+  seed: 42
+  reward_margin: 0.5         # Margin for reward-based loss
+
+data:
+  train_data: "data/qg_train.json"
+  dev_data: "data/qg_dev.json"
+  test_data: "data/qg_test.json"
+
+output:
+  output_dir: "outputs/qg"
+  save_steps: 1000
+  eval_steps: 500
+  logging_steps: 100

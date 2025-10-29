@@ -1,0 +1,26 @@
+# Core dependencies
+torch>=2.0.0
+transformers>=4.30.0
+
+# Data processing
+numpy>=1.24.0
+datasets>=2.14.0
+
+# Evaluation metrics
+rouge-score>=0.1.2
+sacrebleu>=2.3.0
+
+# Configuration
+pyyaml>=6.0
+
+# Optional: Retrieval
+faiss-cpu>=1.7.4  # or faiss-gpu for GPU support
+
+# Optional: Training utilities
+tensorboard>=2.13.0
+wandb>=0.15.0
+
+# Optional: Development
+pytest>=7.4.0
+black>=23.7.0
+flake8>=6.1.0

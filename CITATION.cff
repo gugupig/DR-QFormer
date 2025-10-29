@@ -1,0 +1,25 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+authors:
+  - family-names: "DR-QFormer"
+    given-names: "Contributors"
+title: "DR-QFormer: Parameter-Efficient Middleware for RAG"
+version: 0.1.0
+date-released: 2025-10-29
+url: "https://github.com/gugupig/DR-QFormer"
+repository-code: "https://github.com/gugupig/DR-QFormer"
+license: MIT
+keywords:
+  - retrieval-augmented-generation
+  - RAG
+  - Q-Former
+  - parameter-efficient
+  - BLIP-2
+  - natural-language-processing
+  - machine-learning
+abstract: |
+  DR-QFormer is a BLIP-2-style parameter-efficient middleware for 
+  Retrieval-Augmented Generation (RAG). It uses learnable query tokens 
+  in a Q-Former architecture to bridge frozen retrievers and frozen 
+  large language models, training only the Q-Former and task-specific 
+  heads while keeping retrieval and generation components frozen.
