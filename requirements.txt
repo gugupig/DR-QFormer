@@ -14,7 +14,8 @@ sacrebleu>=2.3.0
 pyyaml>=6.0
 
 # Optional: Retrieval
-faiss-cpu>=1.7.4  # or faiss-gpu for GPU support
+faiss-gpu>=1.7.4  # or faiss-gpu for GPU support
+sentence-transformers>=2.2.2
 
 # Optional: Training utilities
 tensorboard>=2.13.0
