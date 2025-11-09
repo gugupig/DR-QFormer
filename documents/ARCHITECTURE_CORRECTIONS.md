@@ -193,12 +193,87 @@ C_qg: Answer + Z → 生成查询
 - [x] 对偶约束机制明确
 - [x] 注意力掩码规格正确
 - [x] 代码注释完整详细
+- [x] **核心Q-Former实现完成** ✅
+- [x] **功能测试全部通过** ✅
+- [x] **详细实现文档完成** ✅
 - [ ] 训练脚本注释待补充
 - [ ] 架构图待更新
 - [ ] 数据格式文档待补充
 
+## 最新实现状态 (Latest Implementation Status)
+
+### ✅ v0.2.1 - 注意力权重导出 (2025-11-02)
+
+#### 新增功能 (New Features)
+1. **注意力权重导出** (`dr_qformer/models/qformer.py`)
+   - ✅ SA权重导出: `[batch, num_heads, N+1, N+1]` 每层
+   - ✅ CA权重导出: `[batch, num_heads, N, k]` 每层
+   - ✅ 设置 `need_weights=True, average_attn_weights=False`
+   - ✅ 保留每个注意力头的独立权重
+   
+2. **注意力分析工具**
+   - ✅ `test_attention_weights.py` - 验证权重导出功能
+   - ✅ `analyze_attention.py` - 详细注意力模式分析
+   - ✅ 支持分析"哪几个LQ关注了哪几段"
+   - ✅ 支持Primal/Dual模式对比
+
+3. **分析能力**
+   - ✅ LQs对query/answer embedding的注意力
+   - ✅ 片段接收注意力统计
+   - ✅ 注意力选择性和多样性 (熵)
+   - ✅ 每个头的独立注意力模式
+   - ✅ LQ到片段的注意力映射
+
+### ✅ v0.2.0 - 核心Q-Former实现 (2025-11-01)
+
+#### 已完成 (Completed)
+1. **DRQFormer主类** (`dr_qformer/models/qformer.py`)
+   - ✅ 56.7M可训练参数
+   - ✅ 可学习查询tokens (LQs): 32个参数化向量
+   - ✅ 6层Transformer堆叠 (可配置)
+   - ✅ 温度参数 (为Task E预留)
+
+2. **QFormerLayer实现**
+   - ✅ Stage 1: Self-Attention (SA) - LQs融合query/answer
+   - ✅ Stage 2: Cross-Attention (CA) - LQs关注片段
+   - ✅ Stage 3: Feed-Forward Network (FFN)
+   - ✅ Pre-LayerNorm + 残差连接
+
+3. **训练模式**
+   - ✅ Primal Mode (QA): `query_embeds` → `z_qa`
+   - ✅ Dual Mode (QG): `answer_embeds` → `z_qg`
+   - ✅ 隐式对偶约束 (参数共享)
+
+4. **测试与文档**
+   - ✅ 功能测试 (`simple_test_qformer.py`) - 5/5通过
+   - ✅ 架构可视化 (`visualize_drqformer.py`)
+   - ✅ 实现指南 (`DR_QFORMER_IMPLEMENTATION.md`)
+   - ✅ 实现总结 (`IMPLEMENTATION_SUMMARY.md`)
+
+#### 测试结果
+```
+✅ All tests passed!
+📊 DR-QFormer Architecture Summary:
+   - Parameters: 56,736,769
+   - Memory: ~216 MB (FP32)
+   - Tests: 5/5 passing
+
+✅ Attention Weight Export:
+   - SA weights: [batch, num_heads, N+1, N+1] per layer
+   - CA weights: [batch, num_heads, N, k] per layer
+   - Per-head weights preserved (not averaged)
+   - Can analyze LQ-to-fragment attention mappings
+```
+
+#### 下一步 (Next Steps)
+1. 实现任务头 (EntailmentHead, SortingHead, CondenseHead)
+2. 集成冻结retriever (Contriever, DPR, E5, BGE)
+3. 集成冻结LLM (LLaMA, Mistral, Phi)
+4. 实现训练任务 (E, S, C) 的损失函数
+5. 数据准备工具 (gt_k, soft_targets生成)
+
 ---
 
-**更新时间**: 2025-10-29
-**负责人**: AI助手根据用户中文需求文档
-**状态**: 核心架构和代码注释已完成，文档补充进行中
+**更新时间**: 2025-11-01
+**负责人**: AI助手根据用户中文需求文档 + BLIP-2参考实现
+**状态**: ✅ 核心Q-Former实现完成并测试通过，任务头和训练循环待开发

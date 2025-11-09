@@ -347,7 +347,13 @@ class CustomHead(nn.Module):
 
 This is a **barebones scaffold**. Key areas to implement:
 
-- [ ] Q-Former forward pass (attention layers, masks)
+- [x] **Q-Former Core Architecture** (`dr_qformer/models/qformer.py`) ✅
+  - [x] DRQFormer main class with learnable query tokens (LQs)
+  - [x] QFormerLayer with SA + CA + FFN stages
+  - [x] Primal (QA) and Dual (QG) mode support
+  - [x] Attention masking (SA and CA)
+  - [x] Auxiliary outputs for task heads
+  - [x] ~57M parameters (medium config)
 - [ ] Task head forward passes (pooling, projection)
 - [ ] Retriever integration (corpus loading, vector search)
 - [ ] LLM integration (soft prompt prefix injection)
@@ -357,6 +363,17 @@ This is a **barebones scaffold**. Key areas to implement:
 - [ ] Checkpoint save/load implementation
 - [ ] Logging (TensorBoard, Weights & Biases)
 - [ ] Distributed training support
+
+### 🎉 Recent Updates
+
+**2025-11-01: Core Q-Former Implementation Complete** ✅
+- Fully implemented DR-QFormer cross-attention architecture
+- Tested with Primal (QA) and Dual (QG) modes
+- All tests passing (see `simple_test_qformer.py`)
+- Comprehensive documentation and visualization tools added
+- See `IMPLEMENTATION_SUMMARY.md` for details
+
+**Next Steps**: Implement task heads (E, S, C) and integrate frozen models.
 
 See `# TODO` comments throughout the codebase for detailed implementation notes.
 
