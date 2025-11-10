@@ -1,8 +1,14 @@
 """
-Task S: Fragment-Level Sorting Supervision.
+Task S: Fragment-Level Sorting Supervision (Prior Distribution Learning).
 
-Train Q-Former + FragmentRankingHead to rank retrieved fragments by relevance.
-Implements dynamic curriculum learning: Teacher supervision → Posterior alignment.
+Core Training Objective:
+- Learn **prior distribution** π_θ(p|q): Q-Former's fragment importance prediction
+- Curriculum learning: Teacher signal (reranker) → Posterior signal (LLM attention)
+- **Bayesian-inspired closed loop**: Minimize JS divergence with posterior from Task C
+
+Optional Regularization:
+- Dual training (Primal QA + Dual QG) can be enabled with --dual_mode
+- Expected gain: ~1-3% improvement (auxiliary, not core mechanism)
 """
 
 import sys
@@ -67,9 +73,9 @@ class TaskSArgs:
     batch_size: int = 8
     max_steps: int = 10000
     
-    # Dual mode
-    dual_mode: bool = True  # Enable Primal + Dual training
-    dual_weight: float = 0.5  # Weight for dual loss
+    # Optional Dual mode (regularization only, not core mechanism)
+    dual_mode: bool = False  # Enable optional Primal + Dual training (default: disabled)
+    dual_weight: float = 0.1  # Weight for dual loss (small regularization coefficient)
     
     # Paths
     retriever_model: str = "sentence-transformers/all-MiniLM-L6-v2"

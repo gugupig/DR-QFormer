@@ -286,7 +286,7 @@ blip2_impl_examples/                # Reference implementations
 All three tasks jointly train the Q-Former to implement the **prior-posterior feedback loop**, operating on **text fragments (K chunks)**.  
 **Optional**: Each task supports both **Primal (QA)** and **Dual (QG)** modes for bidirectional regularization.
 
-### Task E: Fragment-Level Entailment Tagging (蕴含-标注) ✅
+### Task E: Fragment-Level Entailment Tagging ✅
 **Status**: **COMPLETE** - Spec v1.1 fully implemented and tested (8/8 acceptance criteria passed)
 
 **Purpose**: Learn "answerability/entailment" to act as a **fragment-level filter/tagger**.
@@ -319,7 +319,7 @@ All three tasks jointly train the Q-Former to implement the **prior-posterior fe
 
 ---
 
-### Task S: Fragment-Level Sorting Supervision (排序-监督) ✅
+### Task S: Fragment-Level Sorting Supervision ✅
 **Status**: **COMPLETE** - All features implemented with dynamic K support
 
 **Purpose**: Learn **fragment-level ranking** by supervising CA attention weight distributions.
@@ -351,7 +351,7 @@ All three tasks jointly train the Q-Former to implement the **prior-posterior fe
 
 ---
 
-### Task C: Condensing-Generation (精炼-生成) ✅
+### Task C: Condensing-Generation ✅
 **Status**: **CORE COMPLETE** - Contrastive NLL framework ready, awaiting LLM integration
 
 **Purpose**: Train Q-Former to extract **LLM-useful condensed knowledge** that reduces perplexity.

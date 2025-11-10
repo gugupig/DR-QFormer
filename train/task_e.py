@@ -4,12 +4,17 @@ Task E: Fragment-level Entailment Tagging.
 Train Q-Former + EntailmentHead to predict which retrieved fragments
 are entailed by/relevant to the query.
 
-Specification v1.1:
-- Primal mode (QA): query → predict fragment relevance
-- Dual mode (QG): generated question → predict fragment relevance
-- Shared parameters between modes
+Core Training Objective (Specification v1.1):
+- Learn fragment-level answerability/entailment scores
+- Acts as trainable filter/tagger for downstream tasks
 - Focal loss with importance weighting (longtail, positive class)
 - Drop-LQ regularization during training
+
+Optional Dual Training:
+- Primal mode (QA): query → predict fragment relevance (default)
+- Dual mode (QG): answer → predict fragment relevance (optional regularization)
+- Use --mode=both to enable dual training (~1-3% gain)
+- Default: --mode=primal (core functionality only)
 """
 
 import sys
@@ -72,9 +77,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--retriever_model", type=str, default="facebook/contriever", 
                         help="Frozen retriever model")
     
-    # Training modes
-    parser.add_argument("--mode", type=str, choices=["primal", "dual", "both"], default="both",
-                        help="Training mode: primal (QA), dual (QG), or both")
+    # Training modes (Optional dual training for regularization)
+    parser.add_argument("--mode", type=str, choices=["primal", "dual", "both"], default="primal",
+                        help="Training mode: primal (QA only, default), dual (QG only), or both (optional regularization)")
     
     # Checkpointing
     parser.add_argument("--save_dir", type=str, default="./checkpoints/task_e",
@@ -218,65 +223,67 @@ class TaskETrainer:
                                                     self.args.w_longtail * torch.ones_like(gt_labels),
                                                     importance_weights)
             
-            # Dual Training (Spec v1.1): Two forwards per step with shared parameters
-            # 1. Primal forward (query_embeds)
-            z_primal, aux_primal = self.qformer(
-                query_embeds=q_embeds,  
-                p_embeds=p_embeds,
-                pool_padding_mask=pool_padding_mask
-            )  # z: [batch, N, d], aux: dict with raw scores
+            # === Primal Forward (query_embeds) ===
+            loss_primal = torch.tensor(0.0, device=self.device)
+            if self.args.mode in ["primal", "both"]:
+                z_primal, aux_primal = self.qformer(
+                    query_embeds=q_embeds,  
+                    p_embeds=p_embeds,
+                    pool_padding_mask=pool_padding_mask
+                )
+                
+                ca_raw_scores_per_head_primal = aux_primal.get("ca_raw_scores_per_head", None)
+                
+                head_out_primal = self.head(
+                    z=z_primal,
+                    ca_raw_scores_per_head=ca_raw_scores_per_head_primal,
+                    pool_padding_mask=pool_padding_mask,
+                    training=True
+                )
+                fragment_logits_primal = head_out_primal['fragment_logits']
+                
+                loss_primal = compute_focal_loss(
+                    logits=fragment_logits_primal,
+                    gt_labels=gt_labels,
+                    importance_weights=importance_weights,
+                    pool_padding_mask=pool_padding_mask,
+                    focal_gamma=self.args.focal_gamma,
+                    focal_alpha=self.args.focal_alpha,
+                )
             
-            # Extract pre-softmax raw CA scores
-            ca_raw_scores_per_head_primal = aux_primal.get("ca_raw_scores_per_head", None)  # List of [B, H, N, K]
+            # === Optional Dual Forward (answer_embeds) ===
+            loss_dual = torch.tensor(0.0, device=self.device)
+            if self.args.mode in ["dual", "both"]:
+                z_dual, aux_dual = self.qformer(
+                    answer_embeds=a_embeds,
+                    p_embeds=p_embeds,
+                    pool_padding_mask=pool_padding_mask
+                )
+                
+                ca_raw_scores_per_head_dual = aux_dual.get("ca_raw_scores_per_head", None)
+                
+                head_out_dual = self.head(
+                    z=z_dual,
+                    ca_raw_scores_per_head=ca_raw_scores_per_head_dual,
+                    pool_padding_mask=pool_padding_mask,
+                    training=True
+                )
+                fragment_logits_dual = head_out_dual['fragment_logits']
+                
+                loss_dual = compute_focal_loss(
+                    logits=fragment_logits_dual,
+                    gt_labels=gt_labels,
+                    importance_weights=importance_weights,
+                    pool_padding_mask=pool_padding_mask,
+                    focal_gamma=self.args.focal_gamma,
+                    focal_alpha=self.args.focal_alpha,
+                )
             
-            # Forward through EntailmentHead (training=True for Drop-LQ)
-            head_out_primal = self.head(
-                z=z_primal,
-                ca_raw_scores_per_head=ca_raw_scores_per_head_primal,
-                pool_padding_mask=pool_padding_mask,
-                training=True
-            )
-            fragment_logits_primal = head_out_primal['fragment_logits']  # [batch, k]
-            
-            # Compute L_primal using standalone loss function
-            loss_primal = compute_focal_loss(
-                logits=fragment_logits_primal,
-                gt_labels=gt_labels,
-                importance_weights=importance_weights,
-                pool_padding_mask=pool_padding_mask,
-                focal_gamma=self.args.focal_gamma,
-                focal_alpha=self.args.focal_alpha,
-            )
-            
-            # 2. Dual forward (answer_embeds) - Use real answer embeddings
-            z_dual, aux_dual = self.qformer(
-                answer_embeds=a_embeds,  # Real answer embeddings (from batch or fallback to q_embeds)
-                p_embeds=p_embeds,
-                pool_padding_mask=pool_padding_mask
-            )
-            
-            ca_raw_scores_per_head_dual = aux_dual.get("ca_raw_scores_per_head", None)
-            
-            head_out_dual = self.head(
-                z=z_dual,
-                ca_raw_scores_per_head=ca_raw_scores_per_head_dual,
-                pool_padding_mask=pool_padding_mask,
-                training=True
-            )
-            fragment_logits_dual = head_out_dual['fragment_logits']
-            
-            # Compute L_dual (same gt_labels and importance_weights)
-            loss_dual = compute_focal_loss(
-                logits=fragment_logits_dual,
-                gt_labels=gt_labels,
-                importance_weights=importance_weights,
-                pool_padding_mask=pool_padding_mask,
-                focal_gamma=self.args.focal_gamma,
-                focal_alpha=self.args.focal_alpha,
-            )
-            
-            # Total loss: L_primal + L_dual
-            loss = loss_primal + loss_dual
+            # Combined loss (dual training uses small weight by default)
+            if self.args.mode == "both":
+                loss = loss_primal + 0.1 * loss_dual  # Small regularization weight
+            else:
+                loss = loss_primal + loss_dual
             
             # Backward pass
             self.optimizer.zero_grad()

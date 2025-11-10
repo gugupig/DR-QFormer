@@ -1,8 +1,20 @@
 """
-Task C: Condensing-Generation with Contrastive NLL Loss.
+Task C: Condensing-Generation (Posterior Distribution Extraction).
 
-Train Q-Former + CondenseHead to produce knowledge prefix Z that reduces
-frozen LLM perplexity (NLL). Uses dual-path teacher forcing and posterior extraction.
+Core Training Objective:
+- Produce knowledge prefix Z that reduces frozen LLM perplexity (NLL)
+- Extract **posterior distribution** q_ψ(p|q,a) from LLM attention during generation
+- Contrastive NLL: Compare LLM(with Z) vs. LLM(without Z)
+- Feed posterior back to Task S for Bayesian-inspired closed loop
+
+Implementation:
+- Dual-path teacher forcing: WITH evidence vs. WITHOUT evidence (contrastive learning)
+- Adaptive margin based on NLL gain statistics
+- Posterior extraction from LLM cross-attention weights
+- Only Q-Former + CondenseHead trainable (LLM frozen)
+
+Note: "Dual-path" here refers to WITH/WITHOUT evidence comparison, 
+NOT Primal/Dual (QA/QG) training modes.
 
 Design: v8.0 - Pure Teacher Forcing, Contrastive NLL, Subset Posterior
 """
