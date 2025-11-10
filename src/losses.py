@@ -144,10 +144,6 @@ def entailment_loss(
     return loss
 
 
-# Alias for backward compatibility
-compute_entailment_loss = compute_focal_loss
-
-
 def get_curriculum_weights(
     current_step: int,
     total_steps: int,
@@ -1102,7 +1098,3 @@ def compute_condensing_loss(
         'margin': margin.detach(),
         'posterior_q_psi_U': posterior_q_psi_U,
     }
-
-
-# Alias for Task C (matches joint trainer expectations)
-compute_contrastive_nll_with_posterior = compute_condensing_loss
