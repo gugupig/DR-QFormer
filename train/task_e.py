@@ -81,6 +81,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mode", type=str, choices=["primal", "dual", "both"], default="primal",
                         help="Training mode: primal (QA only, default), dual (QG only), or both (optional regularization)")
     
+    # LQ Entropy Regularization (Optional)
+    parser.add_argument("--enable_lq_entropy_reg", action="store_true", default=False,
+                        help="Enable LQ-level entropy regularization to prevent attention collapse")
+    parser.add_argument("--lambda_entropy_start", type=float, default=0.005,
+                        help="Initial entropy regularization weight (Task E: 0.005)")
+    parser.add_argument("--lambda_entropy_end", type=float, default=0.0005,
+                        help="Final entropy regularization weight (Task E: 0.0005)")
+    parser.add_argument("--entropy_target_ratio", type=float, default=0.5,
+                        help="Target entropy ratio (0.5=allow 50% concentration, Task E needs focus)")
+    
     # Checkpointing
     parser.add_argument("--save_dir", type=str, default="./checkpoints/task_e",
                         help="Directory to save checkpoints")
@@ -284,6 +294,25 @@ class TaskETrainer:
                 loss = loss_primal + 0.1 * loss_dual  # Small regularization weight
             else:
                 loss = loss_primal + loss_dual
+            
+            # === Optional LQ Entropy Regularization ===
+            if self.args.enable_lq_entropy_reg:
+                # Curriculum weight (linear decay: high exploration → low task-driven)
+                total_steps = len(train_loader) * self.args.epochs
+                current_step = epoch * len(train_loader) + batch_idx
+                progress = current_step / total_steps
+                lambda_entropy = self.args.lambda_entropy_start * (1 - 0.9 * progress)
+                lambda_entropy = max(lambda_entropy, self.args.lambda_entropy_end)
+                
+                # Use primal's ca_raw_scores (both modes have same entropy target)
+                if self.args.mode in ["primal", "both"] and ca_raw_scores_per_head_primal is not None:
+                    from dr_qformer.losses import compute_lq_entropy_loss
+                    entropy_loss = compute_lq_entropy_loss(
+                        ca_raw_scores_per_head=ca_raw_scores_per_head_primal,
+                        pool_padding_mask=pool_padding_mask,
+                        target_ratio=self.args.entropy_target_ratio,
+                    )
+                    loss = loss + lambda_entropy * entropy_loss
             
             # Backward pass
             self.optimizer.zero_grad()

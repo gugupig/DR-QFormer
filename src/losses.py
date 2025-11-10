@@ -689,6 +689,183 @@ def combined_loss(
     return None
 
 
+def compute_lq_entropy_loss(
+    ca_raw_scores_per_head: list,
+    pool_padding_mask: Tensor,
+    target_ratio: float = 0.7,
+) -> Tensor:
+    """
+    LQ-Level Entropy Regularization to prevent over-concentration.
+    
+    Purpose: Encourage each Learnable Query (LQ) to attend to multiple fragments,
+             preventing "winner-takes-all" collapse where one LQ dominates attention.
+             This improves representation diversity and facilitates LQ compression (32→16→8).
+    
+    Motivation:
+    ===========
+    Without regularization, multiple LQs may learn redundant attention patterns:
+        LQ_0: [0.9, 0.05, 0.05]  # Focuses on fragment 0
+        LQ_1: [0.85, 0.10, 0.05] # Also focuses on fragment 0
+        LQ_2: [0.88, 0.07, 0.05] # Still focuses on fragment 0
+    
+    This wastes model capacity and makes LQ compression difficult (can't identify
+    which LQs are truly important).
+    
+    With entropy regularization, LQs are encouraged to distribute attention:
+        LQ_0: [0.4, 0.3, 0.2, 0.1]   # Moderate distribution
+        LQ_1: [0.2, 0.4, 0.3, 0.1]   # Different pattern
+        LQ_2: [0.3, 0.2, 0.15, 0.35] # Yet another pattern
+    
+    Args:
+        ca_raw_scores_per_head: List of [B, H, N_lq, K] cross-attention scores per layer
+                               Raw QK^T scores before softmax
+        pool_padding_mask: [B, K] bool mask (True=valid fragment, False=padding)
+        target_ratio: Target entropy ratio relative to uniform (default: 0.7)
+                     - 1.0 = uniform distribution (maximum entropy)
+                     - 0.7 = conservative (allow 30% concentration)
+                     - 0.5 = moderate (allow 50% concentration)
+    
+    Returns:
+        entropy_loss: Scalar loss (minimize to encourage higher entropy)
+    
+    Formula:
+    ========
+    1. Average scores across layers and heads:
+       ca_scores_avg[b, n, k] = mean_l,h(ca_raw_scores_per_head[l][b, h, n, k])
+    
+    2. Apply mask and softmax per LQ:
+       ca_probs[b, n, k] = softmax_k(ca_scores_avg[b, n, k]) for valid k
+    
+    3. Compute entropy per LQ:
+       H[b, n] = -Σ_k ca_probs[b, n, k] · log(ca_probs[b, n, k])
+    
+    4. Compute target entropy (uniform over valid K):
+       H_target[b] = log(K_eff[b])  where K_eff = number of valid fragments
+       H_target_scaled[b] = target_ratio · H_target[b]
+    
+    5. MSE loss to encourage entropy close to target:
+       loss = mean_b,n((H[b, n] - H_target_scaled[b])^2)
+    
+    Design Choices:
+    ===============
+    1. Why target_ratio < 1.0?
+       - Tasks may inherently need some concentration (e.g., Task E for single-fragment answers)
+       - 0.7 allows 30% concentration while preventing collapse
+       - Conservative approach: prevent over-regularization
+    
+    2. Why MSE instead of directly minimizing -H?
+       - MSE encourages entropy close to target (not arbitrarily high)
+       - Prevents forcing uniform when task requires concentration
+       - More stable gradients
+    
+    3. Why average across layers and heads?
+       - LQs should learn consistent patterns across layers
+       - Reduces noise from individual layer/head variations
+       - Aligns with how FragmentRankingHead aggregates attention
+    
+    Usage in Training:
+    ==================
+    Typically used with curriculum learning (high → low weight):
+    
+    ```python
+    # Curriculum weight decay
+    lambda_entropy = lambda_start * (1 - 0.9 * step / total_steps)
+    
+    # Main task loss
+    loss_main = compute_focal_loss(...)  # or compute_ranking_loss(...)
+    
+    # Optional entropy regularization
+    if args.enable_lq_entropy_reg:
+        loss_entropy = compute_lq_entropy_loss(
+            ca_raw_scores_per_head=aux['ca_raw_scores_per_head'],
+            pool_padding_mask=pool_padding_mask,
+            target_ratio=0.7,  # Conservative
+        )
+        loss_total = loss_main + lambda_entropy * loss_entropy
+    else:
+        loss_total = loss_main
+    ```
+    
+    Task-Specific Recommendations:
+    ==============================
+    - Task E (Entailment): Optional, default OFF (may need concentration)
+      - If enabled: target_ratio=0.5, lambda=0.005→0.0005
+    
+    - Task S (Ranking): Recommended, default ON (diversity important for prior)
+      - target_ratio=0.7, lambda=0.01→0.001
+    
+    - Task C (Condensing): Optional, moderate (diversity vs. posterior alignment)
+      - If enabled: target_ratio=0.7, lambda=0.008→0.0001 (fast decay)
+    
+    Relation to LQ Compression:
+    ===========================
+    When planning to compress LQs (32→16→8):
+    
+    1. Training with entropy regularization:
+       - Ensures all 32 LQs contribute (no redundancy)
+       - Each LQ learns distinct attention pattern
+    
+    2. Evaluating LQ importance:
+       - Compute gradient norms per LQ
+       - Or compute attention entropy per LQ
+       - Or ablation study (remove LQ, measure performance)
+    
+    3. Selecting Top-K LQs:
+       - Choose K LQs with highest importance scores
+       - Entropy reg ensures diverse selection (not all similar)
+    
+    4. Knowledge distillation:
+       - 16-LQ model learns from 32-LQ teacher
+       - Distill attention patterns and outputs
+    
+    5. Fine-tuning compressed model:
+       - Disable entropy reg (allow task-specific concentration)
+       - Fine-tune with smaller learning rate
+    
+    Example:
+    ========
+    >>> # Mock data: 2 samples, 3 layers, 8 heads, 32 LQs, 100 fragments
+    >>> ca_scores = [torch.randn(2, 8, 32, 100) for _ in range(3)]
+    >>> mask = torch.ones(2, 100, dtype=torch.bool)
+    >>> mask[:, 80:] = False  # Last 20 fragments padded
+    >>> 
+    >>> loss = compute_lq_entropy_loss(ca_scores, mask, target_ratio=0.7)
+    >>> # loss will be low if LQs have moderate entropy (not too concentrated)
+    """
+    # Stack and average across layers and heads
+    # ca_raw_scores_per_head: List[Tensor[B, H, N_lq, K]]
+    ca_scores = torch.stack(ca_raw_scores_per_head, dim=0)  # [num_layers, B, H, N_lq, K]
+    ca_scores_avg = ca_scores.mean(dim=[0, 2])  # Average over layers and heads → [B, N_lq, K]
+    
+    B, N_lq, K = ca_scores_avg.shape
+    
+    # Apply padding mask: set invalid fragments to large negative
+    # pool_padding_mask: [B, K] → [B, 1, K]
+    mask_expanded = pool_padding_mask.unsqueeze(1)  # [B, 1, K]
+    ca_scores_masked = ca_scores_avg.masked_fill(~mask_expanded, -1e10)
+    
+    # Softmax per LQ to get attention probabilities
+    ca_probs = F.softmax(ca_scores_masked, dim=-1)  # [B, N_lq, K]
+    
+    # Compute entropy per LQ: H = -Σ p·log(p)
+    entropy_per_lq = -(ca_probs * torch.log(ca_probs + 1e-10)).sum(dim=-1)  # [B, N_lq]
+    
+    # Compute target entropy: log(K_eff) for uniform distribution
+    K_eff = pool_padding_mask.sum(dim=-1, keepdim=True).float()  # [B, 1]
+    target_entropy = torch.log(K_eff + 1e-10)  # [B, 1]
+    
+    # Scale by target_ratio (allow some concentration)
+    target_entropy_scaled = target_ratio * target_entropy  # [B, 1]
+    
+    # Expand to match entropy_per_lq shape
+    target_entropy_expanded = target_entropy_scaled.expand(B, N_lq)  # [B, N_lq]
+    
+    # MSE loss: encourage entropy close to target
+    entropy_loss = F.mse_loss(entropy_per_lq, target_entropy_expanded)
+    
+    return entropy_loss
+
+
 def compute_condensing_loss(
     nll_with_evidence: Tensor,
     nll_without_evidence: Tensor,

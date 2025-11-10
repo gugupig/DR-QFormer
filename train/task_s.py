@@ -77,6 +77,12 @@ class TaskSArgs:
     dual_mode: bool = False  # Enable optional Primal + Dual training (default: disabled)
     dual_weight: float = 0.1  # Weight for dual loss (small regularization coefficient)
     
+    # LQ Entropy Regularization (Recommended for Task S - diversity important for prior)
+    enable_lq_entropy_reg: bool = False  # Enable LQ-level entropy regularization
+    lambda_entropy_start: float = 0.01  # Initial entropy weight (Task S: 0.01)
+    lambda_entropy_end: float = 0.001  # Final entropy weight (Task S: 0.001)
+    entropy_target_ratio: float = 0.7  # Target entropy ratio (0.7=conservative)
+    
     # Paths
     retriever_model: str = "sentence-transformers/all-MiniLM-L6-v2"
     train_data: str = "data/train.json"
@@ -294,6 +300,24 @@ class TaskSTrainer:
             tau_gt=self.args.tau_gt,
             alpha_gt=self.args.alpha_gt,  # Teacher Top-L cumulative mass constraint
         )
+        
+        # === Optional LQ Entropy Regularization ===
+        if self.args.enable_lq_entropy_reg and ca_raw_scores_per_head is not None:
+            # Curriculum weight (linear decay)
+            progress = self.global_step / self.args.max_steps
+            lambda_entropy_curr = self.args.lambda_entropy_start * (1 - 0.9 * progress)
+            lambda_entropy_curr = max(lambda_entropy_curr, self.args.lambda_entropy_end)
+            
+            from dr_qformer.losses import compute_lq_entropy_loss
+            entropy_loss = compute_lq_entropy_loss(
+                ca_raw_scores_per_head=ca_raw_scores_per_head,
+                pool_padding_mask=pool_padding_mask,
+                target_ratio=self.args.entropy_target_ratio,
+            )
+            
+            # Add to total loss
+            loss_dict["loss"] = loss_dict["loss"] + lambda_entropy_curr * entropy_loss
+            loss_dict["loss_entropy_lq"] = entropy_loss.item()
         
         return loss_dict
 

@@ -92,6 +92,7 @@ class EntailmentHead(nn.Module):
         z: Optional[Tensor] = None, 
         ca_raw_scores_per_head: Optional[list] = None,
         pool_padding_mask: Optional[Tensor] = None,
+        lq_drop_mask: Optional[Tensor] = None,
         training: bool = True
     ) -> dict:
         """
@@ -103,6 +104,9 @@ class EntailmentHead(nn.Module):
                                    Each tensor: [batch, num_heads, N, k]
                                    These are QK^T/sqrt(d_head) BEFORE softmax
             pool_padding_mask: [batch, k] bool mask (True=valid, False=padding)
+            lq_drop_mask: [batch, N, 1] bool mask for unified Drop-LQ
+                         True = keep LQ, False = drop LQ
+                         If None, internal Drop-LQ is used (if enabled)
             training: Whether in training mode (affects Drop-LQ)
         
         Returns:
@@ -156,13 +160,25 @@ class EntailmentHead(nn.Module):
         ca_scores_avg = ca_scores_stacked.mean(dim=0)  # [batch, N, k]
         
         # Step 3: Drop-LQ regularization (training only)
-        if training and self.p_drop_lq > 0:
-            ca_scores_dropped = self._apply_drop_lq(ca_scores_avg)
+        if training:
+            if lq_drop_mask is not None:
+                # Use external unified mask (for multi-task training)
+                ca_scores_dropped = self._apply_drop_lq(ca_scores_avg, mask=lq_drop_mask)
+            elif self.p_drop_lq > 0:
+                # Use internal random mask (for single-task training)
+                ca_scores_dropped = self._apply_drop_lq(ca_scores_avg, mask=None)
+            else:
+                ca_scores_dropped = ca_scores_avg
         else:
             ca_scores_dropped = ca_scores_avg
         
         # Step 4: LogSumExp aggregation over N LQs → [batch, k]
         fragment_logits = self._logsumexp_aggregate(ca_scores_dropped)
+        
+        # Step 5: Apply final pool_padding_mask to output logits
+        # This ensures padding fragments have very negative logits (will be ignored in BCE loss)
+        if pool_padding_mask is not None:
+            fragment_logits = fragment_logits.masked_fill(~pool_padding_mask, -1e4)
         
         # For debug outputs: keep the first layer's per-head scores (before normalization)
         ca_raw_first_layer = ca_raw_scores_per_head[0] if ca_raw_scores_per_head else None
@@ -174,12 +190,14 @@ class EntailmentHead(nn.Module):
             'ca_raw_scores_per_head': ca_raw_first_layer.detach() if ca_raw_first_layer is not None else None  # [batch, num_heads, N, k] first layer raw
         }
     
-    def _apply_drop_lq(self, ca_scores: Tensor) -> Tensor:
+    def _apply_drop_lq(self, ca_scores: Tensor, mask: Optional[Tensor] = None) -> Tensor:
         """
         Apply Drop-LQ regularization with safety protection.
         
         Args:
             ca_scores: [batch, N, k] attention scores
+            mask: [batch, N, 1] optional external mask (True=keep, False=drop)
+                 If None, generate internal random mask
         
         Returns:
             ca_scores_dropped: [batch, N, k] with some LQs masked
@@ -187,21 +205,25 @@ class EntailmentHead(nn.Module):
         batch_size, n_lqs, k = ca_scores.shape
         device = ca_scores.device
         
-        # Generate dropout mask: [batch, N, 1]
-        # 1.0 = keep, 0.0 = drop
-        mask_drop = torch.bernoulli(
-            torch.full((batch_size, n_lqs, 1), 1.0 - self.p_drop_lq, device=device)
-        )
-        
-        # Safety: prevent all LQs being dropped for any sample
-        all_dropped = (mask_drop.sum(dim=1, keepdim=True) == 0)  # [batch, 1, 1]
-        if all_dropped.any():
-            # For samples with all LQs dropped, randomly keep one
-            for b in range(batch_size):
-                if all_dropped[b, 0, 0]:
-                    random_idx_tensor = torch.randint(0, n_lqs, (1,), device=device)
-                    random_idx = int(random_idx_tensor.item())
-                    mask_drop[b, random_idx, 0] = 1.0
+        if mask is not None:
+            # Use external unified mask (for multi-task training)
+            mask_drop = mask.float()  # [batch, N, 1], 1.0=keep, 0.0=drop
+        else:
+            # Generate internal dropout mask: [batch, N, 1]
+            # 1.0 = keep, 0.0 = drop
+            mask_drop = torch.bernoulli(
+                torch.full((batch_size, n_lqs, 1), 1.0 - self.p_drop_lq, device=device)
+            )
+            
+            # Safety: prevent all LQs being dropped for any sample
+            all_dropped = (mask_drop.sum(dim=1, keepdim=True) == 0)  # [batch, 1, 1]
+            if all_dropped.any():
+                # For samples with all LQs dropped, randomly keep one
+                for b in range(batch_size):
+                    if all_dropped[b, 0, 0]:
+                        random_idx_tensor = torch.randint(0, n_lqs, (1,), device=device)
+                        random_idx = int(random_idx_tensor.item())
+                        mask_drop[b, random_idx, 0] = 1.0
         
         # Apply mask: set dropped LQs to large negative value
         ca_scores_dropped = ca_scores.clone()
@@ -298,6 +320,7 @@ class FragmentRankingHead(nn.Module):
         tau_lq: float = 0.2,
         rho_top: float = 0.02,
         l_prime: int = 16,
+        p_drop_lq: float = 0.1,  # Drop-LQ probability (0.0 = disabled)
         hidden_dim: Optional[int] = None  # Accepted for API compatibility, ignored
     ):
         super().__init__()
@@ -306,12 +329,14 @@ class FragmentRankingHead(nn.Module):
         self.tau_lq = tau_lq
         self.rho_top = rho_top
         self.l_prime = l_prime
+        self.p_drop_lq = p_drop_lq
         
         print(f"FragmentRankingHead initialized:")
         print(f"  - tau_head (Head LSE temperature): {tau_head}")
         print(f"  - tau_lq (LQ LSE temperature): {tau_lq}")
         print(f"  - rho_top (Teacher Top-L ratio): {rho_top}")
         print(f"  - l_prime (Student Hard Negatives): {l_prime}")
+        print(f"  - p_drop_lq (Drop-LQ probability): {p_drop_lq}")
         if hidden_dim is not None:
             print(f"  - hidden_dim provided ({hidden_dim}) but ignored (using raw scores)")
     
@@ -320,6 +345,7 @@ class FragmentRankingHead(nn.Module):
         z: Optional[Tensor] = None,
         ca_raw_scores_per_head: Optional[list] = None,
         pool_padding_mask: Optional[Tensor] = None,
+        lq_drop_mask: Optional[Tensor] = None,
         training: bool = True
     ) -> dict:
         """
@@ -329,7 +355,10 @@ class FragmentRankingHead(nn.Module):
             z: Q-Former output [batch, N_lq, d] (not used, kept for interface compatibility)
             ca_raw_scores_per_head: List of [batch, num_heads, N_lq, K] per layer
             pool_padding_mask: [batch, K] valid fragment mask
-            training: Whether in training mode (unused here, kept for consistency)
+            lq_drop_mask: [batch, N, 1] bool mask for unified Drop-LQ
+                         True = keep LQ, False = drop LQ
+                         If None, internal Drop-LQ is used (if enabled)
+            training: Whether in training mode (affects Drop-LQ)
         
         Returns:
             dict with:
@@ -376,6 +405,15 @@ class FragmentRankingHead(nn.Module):
         scores_scaled = ca_raw_scores_masked / self.tau_head
         scores_head_lse = torch.logsumexp(scores_scaled, dim=1) * self.tau_head  # [batch, N_lq, K]
         
+        # Step 1.5: Apply Drop-LQ regularization (training only)
+        if training:
+            if lq_drop_mask is not None:
+                # Use external unified mask (for multi-task training)
+                scores_head_lse = self._apply_drop_lq(scores_head_lse, mask=lq_drop_mask)
+            elif self.p_drop_lq > 0:
+                # Use internal random mask (for single-task training)
+                scores_head_lse = self._apply_drop_lq(scores_head_lse, mask=None)
+        
         # Step 2: LQ-level LSE aggregation
         # LSE over LQ tokens: [batch, N_lq, K] → [batch, K]
         scores_lq_scaled = scores_head_lse / self.tau_lq
@@ -391,6 +429,52 @@ class FragmentRankingHead(nn.Module):
             "ranking_logits": ranking_logits,  # [batch, K]
             "ca_raw_scores_avg": ca_raw_scores_avg.detach(),  # [batch, N_lq, K]
         }
+    
+    def _apply_drop_lq(self, ca_scores: Tensor, mask: Optional[Tensor] = None) -> Tensor:
+        """
+        Apply Drop-LQ regularization with safety protection.
+        
+        Args:
+            ca_scores: [batch, N_lq, K] attention scores
+            mask: [batch, N_lq, 1] optional external mask (True=keep, False=drop)
+                 If None, generate internal random mask
+        
+        Returns:
+            ca_scores_dropped: [batch, N_lq, K] with some LQs masked to -1e4
+        
+        Implementation:
+        - Randomly mask out p_drop_lq proportion of LQ tokens
+        - Masked LQs are set to -1e4 (effectively zero after softmax/LSE)
+        - Safety: ensure at least one LQ remains active per sample
+        """
+        batch_size, n_lqs, k = ca_scores.shape
+        device = ca_scores.device
+        
+        if mask is not None:
+            # Use external unified mask (for multi-task training)
+            mask_drop = mask.float()  # [batch, N_lq, 1], 1.0=keep, 0.0=drop
+        else:
+            # Generate internal dropout mask: [batch, N_lq, 1]
+            # 1.0 = keep, 0.0 = drop
+            mask_drop = torch.bernoulli(
+                torch.full((batch_size, n_lqs, 1), 1.0 - self.p_drop_lq, device=device)
+            )
+            
+            # Safety: prevent all LQs being dropped for any sample
+            all_dropped = (mask_drop.sum(dim=1, keepdim=True) == 0)  # [batch, 1, 1]
+            if all_dropped.any():
+                # For samples with all LQs dropped, randomly keep one
+                for b in range(batch_size):
+                    if all_dropped[b, 0, 0]:
+                        random_idx_tensor = torch.randint(0, n_lqs, (1,), device=device)
+                        random_idx = int(random_idx_tensor.item())
+                        mask_drop[b, random_idx, 0] = 1.0
+        
+        # Apply mask: set dropped LQs to large negative value
+        ca_scores_dropped = ca_scores.clone()
+        ca_scores_dropped = ca_scores_dropped + (1.0 - mask_drop) * (-1e4)
+        
+        return ca_scores_dropped
     
     def count_parameters(self) -> int:
         """Count trainable parameters (none - only hyperparameters)."""
@@ -446,10 +530,16 @@ class CondenseHead(nn.Module):
         prefix_embeds: [batch, N, d_llm] soft prompt embeddings for LLM conditioning
     """
     
-    def __init__(self, hidden_dim: int = 768, llm_hidden_dim: Optional[int] = None):
+    def __init__(
+        self, 
+        hidden_dim: int = 768, 
+        llm_hidden_dim: Optional[int] = None,
+        p_drop_lq: float = 0.1,  # Drop-LQ probability (0.0 = disabled)
+    ):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.llm_hidden_dim = llm_hidden_dim or hidden_dim
+        self.p_drop_lq = p_drop_lq
         
         # Projection to LLM embedding dimension
         if hidden_dim != self.llm_hidden_dim:
@@ -459,13 +549,27 @@ class CondenseHead(nn.Module):
         
         # Layer normalization for stable soft prompt embeddings
         self.norm = nn.LayerNorm(self.llm_hidden_dim)
+        
+        print(f"CondenseHead initialized:")
+        print(f"  - hidden_dim: {hidden_dim}")
+        print(f"  - llm_hidden_dim: {self.llm_hidden_dim}")
+        print(f"  - p_drop_lq (Drop-LQ probability): {p_drop_lq}")
     
-    def forward(self, z: Optional[Tensor] = None) -> Optional[Tensor]:
+    def forward(
+        self, 
+        z: Optional[Tensor] = None,
+        lq_drop_mask: Optional[Tensor] = None,
+        training: bool = True
+    ) -> Optional[Tensor]:
         """
         Forward pass for condensing to LLM prefix.
         
         Args:
             z: Q-Former output [batch, N, d]
+            lq_drop_mask: [batch, N, 1] bool mask for unified Drop-LQ
+                         True = keep LQ, False = drop LQ
+                         If None, internal Drop-LQ is used (if enabled)
+            training: Whether in training mode (affects Drop-LQ)
         
         Returns:
             prefix_embeds: [batch, N, d_llm] for LLM soft prompt conditioning
@@ -482,9 +586,10 @@ class CondenseHead(nn.Module):
         
         Implementation:
         ===============
-        1. Project Z to LLM dimension: proj(z) → [batch, N, d_llm]
-        2. Apply layer norm for stable soft prompt embeddings
-        3. Return prefix_embeds for LLM injection
+        1. Apply Drop-LQ regularization (training only)
+        2. Project Z to LLM dimension: proj(z) → [batch, N, d_llm]
+        3. Apply layer norm for stable soft prompt embeddings
+        4. Return prefix_embeds for LLM injection
         
         Note: The actual LLM prefix injection is handled by FrozenLLM adapter,
               not by this head. This head only prepares the embeddings.
@@ -498,7 +603,63 @@ class CondenseHead(nn.Module):
         # Normalize for stability
         prefix_embeds = self.norm(prefix_embeds)
         
+        # Apply Drop-LQ regularization (training only)
+        # IMPORTANT: Apply AFTER projection and norm to ensure dropped LQs remain zero
+        # (Applying before projection would result in non-zero outputs due to bias)
+        if training:
+            if lq_drop_mask is not None:
+                # Use external unified mask (for multi-task training)
+                prefix_embeds = self._apply_drop_lq(prefix_embeds, mask=lq_drop_mask)
+            elif self.p_drop_lq > 0:
+                # Use internal random mask (for single-task training)
+                prefix_embeds = self._apply_drop_lq(prefix_embeds, mask=None)
+        
         return prefix_embeds
+    
+    def _apply_drop_lq(self, z: Tensor, mask: Optional[Tensor] = None) -> Tensor:
+        """
+        Apply Drop-LQ regularization with safety protection.
+        
+        Args:
+            z: [batch, N_lq, d] Q-Former output embeddings
+            mask: [batch, N_lq, 1] optional external mask (True=keep, False=drop)
+                 If None, generate internal random mask
+        
+        Returns:
+            z_dropped: [batch, N_lq, d] with some LQs zeroed out
+        
+        Implementation:
+        - Randomly zero out p_drop_lq proportion of LQ embeddings
+        - Safety: ensure at least one LQ remains active per sample
+        - Uses binary mask (0 or 1) instead of setting to -1e4
+        """
+        batch_size, n_lqs, d = z.shape
+        device = z.device
+        
+        if mask is not None:
+            # Use external unified mask (for multi-task training)
+            mask_drop = mask.float()  # [batch, N_lq, 1], 1.0=keep, 0.0=drop
+        else:
+            # Generate internal dropout mask: [batch, N_lq, 1]
+            # 1.0 = keep, 0.0 = drop
+            mask_drop = torch.bernoulli(
+                torch.full((batch_size, n_lqs, 1), 1.0 - self.p_drop_lq, device=device)
+            )
+            
+            # Safety: prevent all LQs being dropped for any sample
+            all_dropped = (mask_drop.sum(dim=1, keepdim=True) == 0)  # [batch, 1, 1]
+            if all_dropped.any():
+                # For samples with all LQs dropped, randomly keep one
+                for b in range(batch_size):
+                    if all_dropped[b, 0, 0]:
+                        random_idx_tensor = torch.randint(0, n_lqs, (1,), device=device)
+                        random_idx = int(random_idx_tensor.item())
+                        mask_drop[b, random_idx, 0] = 1.0
+        
+        # Apply mask: zero out dropped LQs
+        z_dropped = z * mask_drop
+        
+        return z_dropped
     
     def count_parameters(self) -> int:
         """Count trainable parameters in CondenseHead."""

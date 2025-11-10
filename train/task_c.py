@@ -246,6 +246,16 @@ def parse_args():
     parser.add_argument('--device', type=str, default='cuda', help='Device')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     
+    # LQ Entropy Regularization (Optional - Moderate for Task C)
+    parser.add_argument('--enable_lq_entropy_reg', action='store_true', default=False,
+                        help='Enable LQ-level entropy regularization')
+    parser.add_argument('--lambda_entropy_start', type=float, default=0.008,
+                        help='Initial entropy weight (Task C: 0.008)')
+    parser.add_argument('--lambda_entropy_end', type=float, default=0.0001,
+                        help='Final entropy weight (Task C: 0.0001, fast decay)')
+    parser.add_argument('--entropy_target_ratio', type=float, default=0.7,
+                        help='Target entropy ratio (0.7=conservative, balance diversity with posterior)')
+    
     # Dataset
     parser.add_argument('--num_samples', type=int, default=100, help='Dummy dataset size')
     parser.add_argument('--k_fragments', type=int, default=50, help='Number of fragments')
@@ -344,6 +354,28 @@ def train_condensing(args):
             )
             
             loss = loss_dict['loss_c']
+            
+            # === Optional LQ Entropy Regularization ===
+            if args.enable_lq_entropy_reg:
+                # Get ca_raw_scores from aux dict
+                ca_raw_scores_per_head = loss_dict.get('ca_raw_scores_per_head', None)
+                
+                if ca_raw_scores_per_head is not None:
+                    # Curriculum weight (fast decay for Task C to avoid posterior conflict)
+                    total_steps = len(train_loader) * args.epochs
+                    current_step = epoch * len(train_loader) + batch_idx
+                    progress = current_step / total_steps
+                    lambda_entropy = args.lambda_entropy_start * (1 - 0.9 * progress)
+                    lambda_entropy = max(lambda_entropy, args.lambda_entropy_end)
+                    
+                    from dr_qformer.losses import compute_lq_entropy_loss
+                    entropy_loss = compute_lq_entropy_loss(
+                        ca_raw_scores_per_head=ca_raw_scores_per_head,
+                        pool_padding_mask=batch['pool_padding_mask'],
+                        target_ratio=args.entropy_target_ratio,
+                    )
+                    
+                    loss = loss + lambda_entropy * entropy_loss
             
             # Backward pass
             optimizer.zero_grad()

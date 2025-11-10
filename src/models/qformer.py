@@ -139,6 +139,7 @@ class DRQFormer(nn.Module):
         sa_mask: Optional[Tensor] = None,
         ca_mask: Optional[Tensor] = None,
         pool_padding_mask: Optional[Tensor] = None,
+        lq_drop_mask: Optional[Tensor] = None,
     ) -> Tuple[Tensor, dict]:
         """
         Forward pass through Q-Former (3-stage cross-attention architecture).
@@ -153,6 +154,11 @@ class DRQFormer(nn.Module):
             p_embeds: Fragment embeddings [batch, k, d] from frozen retriever
             sa_mask: Self-attention mask [batch, N+1, N+1] (optional, default: all-ones)
             ca_mask: Cross-attention mask [batch, N, k] (optional, default: all-ones)
+            pool_padding_mask: [batch, k] bool mask (True=valid, False=padding)
+            lq_drop_mask: [batch, N, 1] bool mask for Drop-LQ regularization
+                         True = keep LQ, False = drop LQ
+                         If None, all LQs are kept (no dropping)
+                         Used for unified Drop-LQ across multiple tasks
         
         Returns:
             z: Contextualized LQ representations [batch, N, d] → fed to task heads
@@ -160,6 +166,7 @@ class DRQFormer(nn.Module):
                 - 'sa_attn_weights': Self-attention weights [batch, num_heads, N+1, N+1]
                 - 'ca_attn_weights': Cross-attention weights [batch, num_heads, N, k]
                 - 'layer_outputs': List of intermediate layer outputs
+                - 'lq_drop_mask': The applied LQ drop mask (passed through or None)
         
         Forward Pass Stages:
         ====================
@@ -247,9 +254,16 @@ class DRQFormer(nn.Module):
         # Final layer normalization (following BLIP-2)
         z = self.final_ln(z)
         
+        # Apply unified Drop-LQ mask if provided (for multi-task training)
+        # This ensures all tasks drop the same LQs in the same training step
+        if lq_drop_mask is not None:
+            z = z * lq_drop_mask.float()  # [batch, N, d] * [batch, N, 1] -> [batch, N, d]
+        
         # Store final outputs in aux
         aux['z_raw'] = x  # Full sequence including q/a_embed
         aux['z_final'] = z  # Normalized LQ representations
+        aux['lq_drop_mask'] = lq_drop_mask  # Pass through for downstream heads
+        aux['pool_padding_mask'] = pool_padding_mask  # Pass through for downstream heads
         
         return z, aux
     
