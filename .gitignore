@@ -33,7 +33,6 @@ ENV/
 checkpoints/
 
 # Data
-data/
 *.json
 *.jsonl
 *.csv
@@ -63,7 +62,6 @@ Thumbs.db
 
 # Model caches
 .cache/
-models/
 pretrained/
 huggingface/
 

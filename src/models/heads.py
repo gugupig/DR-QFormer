@@ -1,0 +1,506 @@
+"""
+Task-specific heads for DR-QFormer (Fragment-Level Operations).
+
+All three tasks operate on **text fragments/chunks** (not full documents):
+- Task E: Fragment-level entailment tagging (蕴含-标注)
+- Task S: Fragment-level sorting supervision (排序-监督)
+- Task C: Condensing-generation (精炼-生成)
+
+Each task supports both Primal (QA) and Dual (QG) training modes.
+All heads operate on Q-Former output Z [batch, N, d].
+"""
+
+from typing import Optional
+
+try:
+    import torch
+    import torch.nn as nn
+    from torch import Tensor
+except ImportError:
+    # Dummy fallback
+    class nn:
+        class Module:
+            pass
+    Tensor = None
+
+
+class EntailmentHead(nn.Module):
+    """
+    Task E: Fragment-Level Entailment Tagging (蕴含-标注).
+    
+    Purpose: Learn "answerability/entailment" to act as a **fragment-level filter/tagger**.
+    
+    Architecture:
+    - Input: CA attention scores from Q-Former [batch, num_heads, N, k]
+    - Output: k logits [batch, k] - one per fragment
+    - Uses LogSumExp aggregation over N LQs with temperature scaling
+    
+    Training Modes:
+    - Primal (QA): Q-Former receives query → predicts which fragments entail the answer
+    - Dual (QG): Q-Former receives answer → predicts which fragments entail the query
+    
+    Supervision:
+    - gt_labels [batch, k]: Binary vector [0,1,0,1,...] marking golden evidence fragments
+    - importance_weights [batch, k]: Fragment-level weights (normal vs longtail)
+    
+    Loss:
+    - Focal Loss with dynamic importance weighting
+    
+    Metrics:
+    - Accuracy, Precision, Recall, F1
+    
+    Args:
+        num_fragments (int): Number of fragments to classify (k). Default: 10
+        tau (float): LogSumExp temperature. Default: 0.5
+        p_drop_lq (float): Drop-LQ probability during training. Default: 0.1
+        focal_gamma (float): Focal loss gamma parameter. Default: 2.0
+        focal_alpha (float): Focal loss alpha parameter. Default: 0.25
+    """
+    
+    def __init__(
+        self, 
+        num_fragments: int = 10,
+        tau: float = 0.5,
+        p_drop_lq: float = 0.1,
+        focal_gamma: float = 2.0,
+        focal_alpha: float = 0.25,
+        hidden_dim: Optional[int] = None  # Accepted for API compatibility, ignored
+    ):
+        super().__init__()
+        self.num_fragments = num_fragments  # Only used as hint, not enforced
+        self.tau = tau
+        self.p_drop_lq = p_drop_lq
+        self.focal_gamma = focal_gamma
+        self.focal_alpha = focal_alpha
+        
+        # NOTE: hidden_dim is accepted but ignored - raw scores don't need it
+        # For dynamic K_pool support, we cannot use fixed-size LayerNorm
+        # Instead, we'll use manual normalization (mean/std) in forward pass
+        # This allows variable K per batch without dimension mismatch
+        self.eps = 1e-5  # For numerical stability in normalization
+        
+        print(f"EntailmentHead initialized:")
+        print(f"  - tau (temperature): {tau}")
+        print(f"  - p_drop_lq: {p_drop_lq}")
+        print(f"  - focal_gamma: {focal_gamma}")
+        print(f"  - focal_alpha: {focal_alpha}")
+        if hidden_dim is not None:
+            print(f"  - hidden_dim provided ({hidden_dim}) but ignored (using raw scores)")
+    
+    def forward(
+        self, 
+        z: Optional[Tensor] = None, 
+        ca_raw_scores_per_head: Optional[list] = None,
+        pool_padding_mask: Optional[Tensor] = None,
+        training: bool = True
+    ) -> dict:
+        """
+        Forward pass for entailment tagging using pre-softmax raw CA scores.
+        
+        Args:
+            z: Q-Former output [batch, N, d] (not used, kept for interface compatibility)
+            ca_raw_scores_per_head: List of pre-softmax raw CA scores per layer
+                                   Each tensor: [batch, num_heads, N, k]
+                                   These are QK^T/sqrt(d_head) BEFORE softmax
+            pool_padding_mask: [batch, k] bool mask (True=valid, False=padding)
+            training: Whether in training mode (affects Drop-LQ)
+        
+        Returns:
+            dict with keys:
+                - fragment_logits: [batch, k] entailment scores for each fragment
+                - ca_raw_scores_avg: [batch, N, k] head-averaged raw scores (detached, for debugging)
+                - ca_raw_scores_per_head: [batch, num_heads, N, k] layer-averaged raw scores (detached, for debugging)
+        
+        Pipeline (Spec v1.1 - Layer-wise Normalization):
+        ------------------------------------------------
+        1. For each layer:
+           a) Apply pool_padding_mask (set padding to -1e4)
+           b) Apply LayerNorm per head along K dimension
+           c) Average over heads → [batch, N, k]
+        2. Aggregate normalized scores across layers (mean)
+        3. Apply Drop-LQ regularization (training only)
+        4. LogSumExp aggregation over N LQs → [batch, k]
+        """
+        if ca_raw_scores_per_head is None or len(ca_raw_scores_per_head) == 0:
+            raise ValueError("ca_raw_scores_per_head is required for EntailmentHead")
+        
+        # ca_raw_scores_per_head: list of [batch, num_heads, N, k], one per layer
+        # Step 1: Process each layer independently
+        normalized_layers = []
+        
+        for layer_idx, ca_raw in enumerate(ca_raw_scores_per_head):
+            # ca_raw: [batch, num_heads, N, k]
+            batch_size, num_heads, n_lqs, k = ca_raw.shape
+            
+            # Step 1a: Apply pool_padding_mask BEFORE LayerNorm
+            # mask: [batch, k] → [batch, 1, 1, k] for broadcasting
+            if pool_padding_mask is not None:
+                mask_expanded = pool_padding_mask.unsqueeze(1).unsqueeze(2)  # [batch, 1, 1, k]
+                ca_raw_masked = ca_raw.masked_fill(~mask_expanded, -1e4)
+            else:
+                ca_raw_masked = ca_raw
+            
+            # Step 1b: Manual normalization per head on last dimension (k fragments)
+            # This supports dynamic K_pool without fixed-size LayerNorm
+            # Normalize along K dimension: (x - mean) / sqrt(var + eps)
+            mean = ca_raw_masked.mean(dim=-1, keepdim=True)  # [batch, num_heads, N, 1]
+            var = ca_raw_masked.var(dim=-1, keepdim=True, unbiased=False)  # [batch, num_heads, N, 1]
+            norm_scores = (ca_raw_masked - mean) / torch.sqrt(var + self.eps)  # [batch, num_heads, N, k]
+            
+            # Step 1c: Average over heads → [batch, N, k]
+            layer_scores_avg = norm_scores.mean(dim=1)
+            normalized_layers.append(layer_scores_avg)
+        
+        # Step 2: Aggregate across layers (mean)
+        ca_scores_stacked = torch.stack(normalized_layers, dim=0)  # [num_layers, batch, N, k]
+        ca_scores_avg = ca_scores_stacked.mean(dim=0)  # [batch, N, k]
+        
+        # Step 3: Drop-LQ regularization (training only)
+        if training and self.p_drop_lq > 0:
+            ca_scores_dropped = self._apply_drop_lq(ca_scores_avg)
+        else:
+            ca_scores_dropped = ca_scores_avg
+        
+        # Step 4: LogSumExp aggregation over N LQs → [batch, k]
+        fragment_logits = self._logsumexp_aggregate(ca_scores_dropped)
+        
+        # For debug outputs: keep the first layer's per-head scores (before normalization)
+        ca_raw_first_layer = ca_raw_scores_per_head[0] if ca_raw_scores_per_head else None
+        
+        # Return dict with debug outputs
+        return {
+            'fragment_logits': fragment_logits,
+            'ca_raw_scores_avg': ca_scores_avg.detach(),  # [batch, N, k] layer-aggregated normalized scores
+            'ca_raw_scores_per_head': ca_raw_first_layer.detach() if ca_raw_first_layer is not None else None  # [batch, num_heads, N, k] first layer raw
+        }
+    
+    def _apply_drop_lq(self, ca_scores: Tensor) -> Tensor:
+        """
+        Apply Drop-LQ regularization with safety protection.
+        
+        Args:
+            ca_scores: [batch, N, k] attention scores
+        
+        Returns:
+            ca_scores_dropped: [batch, N, k] with some LQs masked
+        """
+        batch_size, n_lqs, k = ca_scores.shape
+        device = ca_scores.device
+        
+        # Generate dropout mask: [batch, N, 1]
+        # 1.0 = keep, 0.0 = drop
+        mask_drop = torch.bernoulli(
+            torch.full((batch_size, n_lqs, 1), 1.0 - self.p_drop_lq, device=device)
+        )
+        
+        # Safety: prevent all LQs being dropped for any sample
+        all_dropped = (mask_drop.sum(dim=1, keepdim=True) == 0)  # [batch, 1, 1]
+        if all_dropped.any():
+            # For samples with all LQs dropped, randomly keep one
+            for b in range(batch_size):
+                if all_dropped[b, 0, 0]:
+                    random_idx_tensor = torch.randint(0, n_lqs, (1,), device=device)
+                    random_idx = int(random_idx_tensor.item())
+                    mask_drop[b, random_idx, 0] = 1.0
+        
+        # Apply mask: set dropped LQs to large negative value
+        ca_scores_dropped = ca_scores.clone()
+        ca_scores_dropped = ca_scores_dropped + (1.0 - mask_drop) * (-1e4)
+        
+        return ca_scores_dropped
+    
+    def _logsumexp_aggregate(self, ca_scores: Tensor) -> Tensor:
+        """
+        Numerically stable LogSumExp aggregation over N LQs.
+        
+        Args:
+            ca_scores: [batch, N, k] attention scores
+        
+        Returns:
+            logits: [batch, k] aggregated scores
+        
+        Formula:
+            logit[b,k] = tau * (m[b,k] + log(sum_i(exp((S[b,i,k]/tau) - m[b,k]))))
+            where m[b,k] = max_i(S[b,i,k] / tau)
+        """
+        # Scale by temperature
+        scaled_scores = ca_scores / self.tau  # [batch, N, k]
+        
+        # Max for numerical stability
+        max_scores = scaled_scores.max(dim=1, keepdim=True)[0]  # [batch, 1, k]
+        
+        # Numerically stable exp
+        exp_scores = torch.exp(scaled_scores - max_scores)  # [batch, N, k]
+        
+        # Sum over LQs
+        sum_exp = exp_scores.sum(dim=1)  # [batch, k]
+        
+        # LogSumExp result
+        logits = self.tau * (max_scores.squeeze(1) + torch.log(sum_exp + 1e-8))
+        
+        return logits
+    
+    def count_parameters(self) -> int:
+        """Count trainable parameters in EntailmentHead."""
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+class FragmentRankingHead(nn.Module):
+    """
+    Task S: Fragment-Level Ranking via Dual-LSE Aggregation (排序-监督).
+    
+    Purpose: Train Q-Former's cross-attention to precisely rank fragments from 
+             large evidence pools (K=100~5000).
+    
+    Architecture:
+    - Input: Pre-softmax CA raw scores from Q-Former [batch, num_heads, N_lq, K]
+    - Output: Ranking logits [batch, K] - one score per fragment
+    - Uses dual LogSumExp (LSE) aggregation: Head → LQ → Logits
+    
+    Training Modes:
+    - Primal (QA): Q-Former receives query → ranks fragments by answer relevance
+    - Dual (QG): Q-Former receives answer → ranks fragments by query relevance
+    
+    Supervision:
+    - gt_scores [batch, K]: Teacher reranker scores (e.g., from BM25, DPR)
+    - posterior_scores [batch, K]: Optional LLM feedback scores (from Task C)
+    - Dynamic curriculum: Teacher (early) → Posterior (late)
+    
+    Loss Components:
+    - L_teach: ListNet loss vs teacher scores
+    - L_post: JS divergence vs posterior scores (detached)
+    - L_tail_entropy: Entropy regularization on low-scoring fragments
+    
+    Key Features:
+    - Anti-noise aggregation via dual LSE
+    - Dynamic subset construction (Teacher Top-L + Student Hard Negatives)
+    - Curriculum learning (teacher → posterior transition)
+    
+    Args:
+        num_fragments (int): Number of fragments to rank (K). Default: 100
+        tau_head (float): LSE temperature for head aggregation. Default: 0.1
+        tau_lq (float): LSE temperature for LQ aggregation. Default: 0.2
+        rho_top (float): Dynamic Teacher Top-L ratio. Default: 0.02 (2%)
+        l_prime (int): Student Hard Negatives count. Default: 16
+    
+    Input:
+        ca_raw_scores_per_head: Pre-softmax scores [batch, num_heads, N_lq, K]
+        pool_padding_mask: Valid fragment mask [batch, K] (True=valid, False=padding)
+        
+    Output:
+        ranking_logits: [batch, K] ranking scores (higher = more relevant)
+    """
+    
+    def __init__(
+        self,
+        num_fragments: int = 100,
+        tau_head: float = 0.1,
+        tau_lq: float = 0.2,
+        rho_top: float = 0.02,
+        l_prime: int = 16,
+        hidden_dim: Optional[int] = None  # Accepted for API compatibility, ignored
+    ):
+        super().__init__()
+        self.num_fragments = num_fragments
+        self.tau_head = tau_head
+        self.tau_lq = tau_lq
+        self.rho_top = rho_top
+        self.l_prime = l_prime
+        
+        print(f"FragmentRankingHead initialized:")
+        print(f"  - tau_head (Head LSE temperature): {tau_head}")
+        print(f"  - tau_lq (LQ LSE temperature): {tau_lq}")
+        print(f"  - rho_top (Teacher Top-L ratio): {rho_top}")
+        print(f"  - l_prime (Student Hard Negatives): {l_prime}")
+        if hidden_dim is not None:
+            print(f"  - hidden_dim provided ({hidden_dim}) but ignored (using raw scores)")
+    
+    def forward(
+        self,
+        z: Optional[Tensor] = None,
+        ca_raw_scores_per_head: Optional[list] = None,
+        pool_padding_mask: Optional[Tensor] = None,
+        training: bool = True
+    ) -> dict:
+        """
+        Forward pass using dual LogSumExp (LSE) aggregation.
+        
+        Args:
+            z: Q-Former output [batch, N_lq, d] (not used, kept for interface compatibility)
+            ca_raw_scores_per_head: List of [batch, num_heads, N_lq, K] per layer
+            pool_padding_mask: [batch, K] valid fragment mask
+            training: Whether in training mode (unused here, kept for consistency)
+        
+        Returns:
+            dict with:
+                - ranking_logits: [batch, K] ranking scores
+                - ca_raw_scores_avg: [batch, N_lq, K] averaged raw scores (debug)
+        
+        Dual-LSE Aggregation:
+        ====================
+        Step 1: Head-level LSE (aggregate multi-head scores)
+            scores_h [batch, N_lq, K] = LSE_{h}(raw_scores / tau_head) * tau_head
+            
+        Step 2: LQ-level LSE (aggregate query token scores)
+            ranking_logits [batch, K] = LSE_{lq}(scores_h / tau_lq) * tau_lq
+        
+        Formula:
+            LSE(x) = log(sum(exp(x)))
+            
+        Properties:
+            - Smooth max approximation (as tau → 0, LSE → max)
+            - Differentiable everywhere
+            - Noise-robust (down-weights outliers)
+        """
+        if ca_raw_scores_per_head is None or len(ca_raw_scores_per_head) == 0:
+            raise ValueError("ca_raw_scores_per_head is required for FragmentRankingHead")
+        
+        # Use last layer's CA scores (most refined)
+        ca_raw_scores = ca_raw_scores_per_head[-1]  # [batch, num_heads, N_lq, K]
+        
+        batch_size, num_heads, N_lq, K = ca_raw_scores.shape
+        
+        # Ensure mask type consistency: always convert to bool
+        if pool_padding_mask is None:
+            pool_padding_mask = torch.ones(batch_size, K, dtype=torch.bool, device=ca_raw_scores.device)
+        else:
+            pool_padding_mask = pool_padding_mask.to(torch.bool)
+        
+        # Apply padding mask: set invalid positions to large negative value
+        # Expand mask for broadcasting: [batch, 1, 1, K]
+        mask_expanded = pool_padding_mask.unsqueeze(1).unsqueeze(1)  # [batch, 1, 1, K]
+        ca_raw_scores_masked = ca_raw_scores.masked_fill(~mask_expanded, -1e4)
+        
+        # Step 1: Head-level LSE aggregation
+        # LSE over heads: [batch, num_heads, N_lq, K] → [batch, N_lq, K]
+        scores_scaled = ca_raw_scores_masked / self.tau_head
+        scores_head_lse = torch.logsumexp(scores_scaled, dim=1) * self.tau_head  # [batch, N_lq, K]
+        
+        # Step 2: LQ-level LSE aggregation
+        # LSE over LQ tokens: [batch, N_lq, K] → [batch, K]
+        scores_lq_scaled = scores_head_lse / self.tau_lq
+        ranking_logits = torch.logsumexp(scores_lq_scaled, dim=1) * self.tau_lq  # [batch, K]
+        
+        # Apply final mask to ranking logits
+        ranking_logits = ranking_logits.masked_fill(~pool_padding_mask, -1e4)
+        
+        # Debug outputs
+        ca_raw_scores_avg = ca_raw_scores_masked.mean(dim=1)  # [batch, N_lq, K]
+        
+        return {
+            "ranking_logits": ranking_logits,  # [batch, K]
+            "ca_raw_scores_avg": ca_raw_scores_avg.detach(),  # [batch, N_lq, K]
+        }
+    
+    def count_parameters(self) -> int:
+        """Count trainable parameters (none - only hyperparameters)."""
+        return 0
+
+
+# Alias for backward compatibility
+SortingHead = FragmentRankingHead
+
+
+class CondenseHead(nn.Module):
+    """
+    Task C: Condensing-Generation (精炼-生成).
+    
+    Purpose: Learn to "condense and refine" - ensure Q-Former's extracted Z is useful 
+             for frozen LLM generation.
+    
+    Architecture:
+    - Input: Z from Q-Former [batch, N, d]
+    - Output: N condensed vectors [batch, N, d_llm] fed as soft prompt prefix to LLM
+    - Projection layer to match LLM's embedding dimension if needed
+    
+    Training Modes:
+    ===============
+    Primal (QA) - Contrastive Generation Loss:
+      - Generate with evidence: answer_with_Z = LLM(Query, Z)
+      - Generate without evidence: answer_baseline = LLM(Query, Empty_Z)
+      - Maximize: Reward(answer_with_Z) - Reward(answer_baseline)
+      - Reward based on ROUGE/BLEU/EM with gold answer
+      - Forces Q-Former to extract evidence-dependent information
+    
+    Dual (QG) - Reward Loss:
+      - Generate query from answer: query' = LLM(Answer, Z)
+      - Maximize: Similarity(query', gold_query)
+      - Similarity based on BLEU/ROUGE/BERTScore
+      - Forces Q-Former to extract query-relevant information
+    
+    Loss:
+    - Reward Margin Loss: max(0, margin - (reward_high - reward_low))
+    - Encourages evidence-dependent generation
+    
+    Metrics:
+    - ROUGE-L, BLEU, Exact Match (EM), F1
+    
+    Args:
+        hidden_dim (int): Q-Former hidden dimension. Default: 768
+        llm_hidden_dim (int): LLM hidden dimension. Default: None (uses hidden_dim)
+    
+    Input:
+        z: Q-Former output [batch, N, d]
+        
+    Output:
+        prefix_embeds: [batch, N, d_llm] soft prompt embeddings for LLM conditioning
+    """
+    
+    def __init__(self, hidden_dim: int = 768, llm_hidden_dim: Optional[int] = None):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.llm_hidden_dim = llm_hidden_dim or hidden_dim
+        
+        # Projection to LLM embedding dimension
+        if hidden_dim != self.llm_hidden_dim:
+            self.proj = nn.Linear(hidden_dim, self.llm_hidden_dim)
+        else:
+            self.proj = nn.Identity()
+        
+        # Layer normalization for stable soft prompt embeddings
+        self.norm = nn.LayerNorm(self.llm_hidden_dim)
+    
+    def forward(self, z: Optional[Tensor] = None) -> Optional[Tensor]:
+        """
+        Forward pass for condensing to LLM prefix.
+        
+        Args:
+            z: Q-Former output [batch, N, d]
+        
+        Returns:
+            prefix_embeds: [batch, N, d_llm] for LLM soft prompt conditioning
+        
+        Usage with Frozen LLM:
+        ======================
+        1. Q-Former extracts Z: [batch, N, d]
+        2. CondenseHead projects to d_llm: [batch, N, d_llm]
+        3. Frozen LLM receives:
+           - Soft prompt: prefix_embeds [batch, N, d_llm]
+           - Hard text: query_tokens [batch, seq_q, d_llm]
+           - Combined input: [batch, N+seq_q, d_llm]
+        4. LLM generates answer conditioning on both soft and hard prompts
+        
+        Implementation:
+        ===============
+        1. Project Z to LLM dimension: proj(z) → [batch, N, d_llm]
+        2. Apply layer norm for stable soft prompt embeddings
+        3. Return prefix_embeds for LLM injection
+        
+        Note: The actual LLM prefix injection is handled by FrozenLLM adapter,
+              not by this head. This head only prepares the embeddings.
+        """
+        if z is None:
+            return None
+        
+        # Project to LLM dimension
+        prefix_embeds = self.proj(z)  # [batch, N, d_llm]
+        
+        # Normalize for stability
+        prefix_embeds = self.norm(prefix_embeds)
+        
+        return prefix_embeds
+    
+    def count_parameters(self) -> int:
+        """Count trainable parameters in CondenseHead."""
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+        return None
