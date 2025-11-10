@@ -278,3 +278,93 @@ def combine_masks(*masks) -> Optional[object]:
     # TODO: Implement mask combination
     pass
     return None
+
+
+def generate_lq_drop_mask(
+    batch_size: int,
+    num_lqs: int,
+    drop_rate: float = 0.1,
+    device: Optional[object] = None,
+) -> Optional[object]:
+    """
+    Generate unified Drop-LQ mask for all tasks (E/S/C).
+    
+    Purpose: Randomly drop a fraction of learnable queries (LQs) during training
+             to prevent overfitting and encourage information bottleneck learning.
+             The SAME mask is used across all tasks to ensure consistency.
+    
+    Drop-LQ Mechanism (similar to Dropout):
+    =======================================
+    - Randomly select drop_rate fraction of LQs per sample
+    - Set selected LQ positions to be "dropped" (True in mask)
+    - During forward pass, dropped LQs are masked out or zeroed
+    - Forces remaining LQs to be more informative
+    - Prevents individual LQs from becoming over-specialized
+    
+    Args:
+        batch_size: Number of samples in batch
+        num_lqs: Total number of learnable queries (N)
+        drop_rate: Fraction of LQs to drop (default: 0.1 = 10%)
+        device: torch.device for tensor placement
+    
+    Returns:
+        lq_drop_mask: [batch_size, num_lqs] boolean mask
+                     - True: LQ is DROPPED (masked out)
+                     - False: LQ is ACTIVE (used normally)
+    
+    Example:
+        >>> mask = generate_lq_drop_mask(batch_size=2, num_lqs=8, drop_rate=0.25)
+        >>> # Sample 0: Drop 2 LQs (25% of 8)
+        >>> # mask[0] = [F, F, T, F, F, F, T, F]
+        >>> # Sample 1: Drop 2 LQs (different positions)
+        >>> # mask[1] = [F, T, F, F, F, T, F, F]
+    
+    Training vs. Evaluation:
+    =======================
+    - Training: Apply Drop-LQ with specified drop_rate
+    - Evaluation: Set drop_rate=0.0 (no dropping, use all LQs)
+    
+    Why Unified Mask?
+    =================
+    If different tasks drop different LQs:
+    - Task E sees: LQ[0,1,3,4,5,7] (drops 2,6)
+    - Task S sees: LQ[0,2,3,4,6,7] (drops 1,5)
+    - Task C sees: LQ[1,2,3,4,5,6] (drops 0,7)
+    
+    Problem: Tasks receive inconsistent information, making closed-loop
+             feedback unstable. Task C's posterior uses different LQs than
+             Task S expects.
+    
+    Solution: Use SAME mask for all tasks:
+    - All tasks see: LQ[0,1,3,4,5,7] (drops 2,6)
+    - Task C extracts posterior using LQ[0,1,3,4,5,7]
+    - Task S receives consistent posterior feedback
+    - Closed-loop training is stable
+    
+    Implementation Note:
+    ====================
+    This function generates the mask. The Q-Former forward pass should:
+    1. Apply mask to query_tokens before or during forward
+    2. Pass mask to task heads for consistent masking
+    3. Ensure attention computations respect dropped positions
+    """
+    if device is None:
+        device = torch.device("cpu")
+    
+    # Compute number of LQs to drop per sample
+    num_drop = int(num_lqs * drop_rate)
+    
+    if num_drop == 0:
+        # No dropping
+        return torch.zeros(batch_size, num_lqs, dtype=torch.bool, device=device)
+    
+    # Initialize mask (all False = all active)
+    lq_drop_mask = torch.zeros(batch_size, num_lqs, dtype=torch.bool, device=device)
+    
+    # For each sample, randomly select LQs to drop
+    for b in range(batch_size):
+        # Generate random permutation of LQ indices
+        drop_indices = torch.randperm(num_lqs, device=device)[:num_drop]
+        lq_drop_mask[b, drop_indices] = True
+    
+    return lq_drop_mask

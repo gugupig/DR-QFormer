@@ -26,9 +26,10 @@ from .schedule import TrainingScheduler, ScheduleConfig
 from ..models.qformer import DRQFormer
 from ..models.heads import EntailmentHead, FragmentRankingHead
 from ..losses import (
-    compute_entailment_loss,
+    compute_focal_loss,  # compute_entailment_loss is an alias
     compute_ranking_loss,
-    compute_contrastive_nll_with_posterior,
+    build_train_subset_mask,
+    compute_condensing_loss,  # compute_contrastive_nll_with_posterior is an alias
 )
 from ..utils.masks import generate_lq_drop_mask
 
@@ -149,7 +150,7 @@ class JointTrainer:
             cond_embeds = batch.answer_embeds  # QG: condition on answer
         
         # Generate unified Drop-LQ mask (shared across E/S/C)
-        batch_size, N = self.model.num_lqs, self.model.num_lqs
+        N = self.model.n_queries  # Use correct attribute name
         lq_drop_mask = generate_lq_drop_mask(
             batch_size=batch.batch_size,
             num_lqs=N,
@@ -158,20 +159,21 @@ class JointTrainer:
         )
         
         # Q-Former forward
-        z_lm, aux = self.model(
-            query_embeds=cond_embeds,
-            fragment_embeds=batch.fragment_embeds,
+        # Note: DRQFormer returns (z, aux), not (z_lm, aux)
+        z, aux = self.model(
+            query_embeds=cond_embeds if mode == "primal" else None,
+            answer_embeds=cond_embeds if mode == "dual" else None,
+            p_embeds=batch.fragment_embeds,  # Use correct parameter name
             pool_padding_mask=batch.pool_padding_mask,
             lq_drop_mask=lq_drop_mask,
-            return_lm_proj=True,
         )
         
         return {
-            'z': aux['z_final'],  # [batch, N, d]
-            'z_lm': z_lm,         # [batch, num_lm_tokens, d_lm]
-            'ca_raw_scores': aux.get('ca_raw_scores_per_head'),  # [batch, heads, N, K]
-            'ca_weights': aux.get('ca_weights_per_head'),        # [batch, heads, N, K]
-            'sa_weights': aux.get('sa_weights_per_head'),        # [batch, heads, N+1, N+1]
+            'z': z,  # [batch, N, d] - Final LQ representations
+            'z_final': aux['z_final'],  # Same as z after layer norm
+            'ca_raw_scores': aux.get('ca_raw_scores_per_head'),  # List of [batch, heads, N, K] per layer
+            'ca_weights': aux.get('ca_attn_weights'),             # List of [batch, heads, N, K] per layer
+            'sa_weights': aux.get('sa_attn_weights'),             # List of [batch, heads, N+1, N+1] per layer
             'lq_drop_mask': lq_drop_mask,                        # [batch, N]
             'pool_padding_mask': batch.pool_padding_mask,        # [batch, K]
         }
@@ -200,15 +202,40 @@ class JointTrainer:
             lq_drop_mask=forward_out['lq_drop_mask'],
         )
         
-        # Compute loss
-        loss, metrics = compute_entailment_loss(
+        # Compute loss using Focal Loss
+        loss = compute_focal_loss(
             logits=fragment_logits,
-            labels=batch.entailment_labels,
-            pool_padding_mask=batch.pool_padding_mask,
+            gt_labels=batch.entailment_labels,
             importance_weights=batch.entailment_weights,
-            gamma=self.focal_gamma,
-            alpha=self.focal_alpha,
+            pool_padding_mask=batch.pool_padding_mask,
+            focal_gamma=self.focal_gamma,
+            focal_alpha=self.focal_alpha,
         )
+        
+        # Compute metrics
+        with torch.no_grad():
+            probs = torch.sigmoid(fragment_logits)
+            preds = (probs > 0.5).float()
+            valid_mask = batch.pool_padding_mask.float()
+            
+            # Accuracy
+            correct = ((preds == batch.entailment_labels).float() * valid_mask).sum()
+            total = valid_mask.sum()
+            accuracy = (correct / (total + 1e-8)).item()
+            
+            # Precision/Recall (for positive class)
+            tp = ((preds * batch.entailment_labels) * valid_mask).sum()
+            fp = ((preds * (1 - batch.entailment_labels)) * valid_mask).sum()
+            fn = (((1 - preds) * batch.entailment_labels) * valid_mask).sum()
+            
+            precision = (tp / (tp + fp + 1e-8)).item()
+            recall = (tp / (tp + fn + 1e-8)).item()
+            
+            metrics = {
+                'accuracy': accuracy,
+                'precision': precision,
+                'recall': recall,
+            }
         
         return loss, metrics
     
@@ -220,8 +247,11 @@ class JointTrainer:
         lambda_teach: float = 1.0,
         lambda_post: float = 0.0,
         lambda_ent: float = 0.01,
-        temperature: float = 1.0,
-        alpha_gt: float = 0.9,
+        tau_pred: float = 1.0,
+        tau_gt: float = 1.0,
+        alpha_gt: float = 0.7,
+        rho_top: float = 0.02,
+        l_prime: int = 16,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         Task S: Fragment ranking with teacher→posterior transition.
@@ -233,8 +263,11 @@ class JointTrainer:
             lambda_teach: Weight for teacher (ListNet)
             lambda_post: Weight for posterior (JS divergence)
             lambda_ent: Weight for tail entropy regularization
-            temperature: For adaptive teacher distribution
+            tau_pred: Temperature for student prediction distribution
+            tau_gt: Temperature for teacher target distribution
             alpha_gt: Target cumulative probability for Top-L
+            rho_top: Teacher Top-L ratio (e.g., 0.02 = top 2%)
+            l_prime: Student Hard Negatives count
         
         Returns:
             loss: Scalar tensor
@@ -248,20 +281,38 @@ class JointTrainer:
             lq_drop_mask=forward_out['lq_drop_mask'],
         )
         
-        # Compute loss
-        loss, metrics = compute_ranking_loss(
+        # Build training subset U = Teacher Top-L ∪ Student Hard Negatives
+        train_subset_mask = build_train_subset_mask(
             ranking_logits=ranking_logits,
             gt_scores=batch.ranking_scores,
             pool_padding_mask=batch.pool_padding_mask,
+            rho_top=rho_top,
+            l_prime=l_prime,
+        )
+        
+        # Compute ranking loss (returns dict)
+        loss_dict = compute_ranking_loss(
+            ranking_logits=ranking_logits,
+            gt_scores=batch.ranking_scores,
             posterior_scores=posterior_scores,
+            pool_padding_mask=batch.pool_padding_mask,
+            train_subset_mask=train_subset_mask,
             lambda_teach=lambda_teach,
             lambda_post=lambda_post,
             lambda_entropy=lambda_ent,
-            temperature=temperature,
+            tau_pred=tau_pred,
+            tau_gt=tau_gt,
             alpha_gt=alpha_gt,
-            top_l_dynamic=True,
-            top_lprime=10,  # Hard negatives
         )
+        
+        # Extract loss and metrics
+        loss = loss_dict['loss']
+        metrics = {
+            'loss_teach': loss_dict['loss_teach'].item(),
+            'loss_post': loss_dict['loss_post'].item() if isinstance(loss_dict['loss_post'], torch.Tensor) else loss_dict['loss_post'],
+            'loss_entropy': loss_dict['loss_entropy'].item(),
+            'subset_size': train_subset_mask.sum().item() / train_subset_mask.shape[0],  # Average per sample
+        }
         
         return loss, metrics
     
@@ -552,10 +603,17 @@ if __name__ == "__main__":
     from .joint_data import create_joint_dataloader
     from .schedule import get_default_schedule
     
-    # Create dummy components
-    model = DRQFormer(d=64, N=4, num_heads=2)
-    task_e_head = EntailmentHead(d=64, aggregation_mode="lse")
-    task_s_head = FragmentRankingHead(d=64)
+    # Create dummy components (using correct parameter names)
+    model = DRQFormer(
+        n_queries=4,      # Not N
+        hidden_dim=64,    # Not d
+        num_layers=2,
+        num_heads=2,
+        max_fragments=10,
+        dropout=0.1,
+    )
+    task_e_head = EntailmentHead(hidden_dim=64, aggregation_mode="lse")  # Not d
+    task_s_head = FragmentRankingHead(hidden_dim=64)  # Not d
     
     # PLACEHOLDER: LLM
     llm_model = nn.Identity()
