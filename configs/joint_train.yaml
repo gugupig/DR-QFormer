@@ -1,0 +1,331 @@
+# ===================================================================
+# DR-QFormer Joint Training Configuration (E+S+C Multi-Task)
+# Based on BLIP-2 "Shared Forward + Multi-Objective" Paradigm
+# ===================================================================
+# Design Philosophy:
+#   - ONE Q-Former forward pass produces Z, CA raw scores, LQs
+#   - Task E: Entailment tagging with Focal Loss
+#   - Task S: Fragment ranking with dynamic curriculum (teacher→posterior)
+#   - Task C: Condensing-generation with contrastive NLL
+#   - Bayesian-inspired closed loop: Task C posterior → Task S alignment
+#
+# Training Phases:
+#   - Warm-up (10%): Prior-only (E+S teacher, C disabled)
+#   - Bridge (60%): Gradual posterior integration (λ_teach→λ_post)
+#   - Closed-loop (30%): Posterior-dominated (λ_post high)
+# ===================================================================
+
+# ===================================================================
+# Model Architecture
+# ===================================================================
+model:
+  # Q-Former (shared across tasks)
+  n_queries: 32  # Number of learnable queries (LQs)
+  hidden_dim: 768  # Hidden dimension
+  num_layers: 12  # Number of transformer layers
+  num_heads: 12  # Number of attention heads
+  
+  # Task E: EntailmentHead
+  task_e:
+    tau: 0.5  # LogSumExp temperature
+    p_drop_lq: 0.1  # Drop-LQ probability during training
+    focal_gamma: 2.0  # Focal loss gamma (focus on hard examples)
+    focal_alpha: 0.25  # Focal loss alpha (positive class weight)
+  
+  # Task S: FragmentRankingHead
+  task_s:
+    tau_head: 0.1  # Head-level LSE temperature
+    tau_lq: 0.2  # LQ-level LSE temperature
+    rho_top: 0.02  # Teacher Top-L ratio (2%)
+    l_prime: 16  # Student hard negatives count
+  
+  # Task C: CondenseHead
+  task_c:
+    llm_hidden_dim: 4096  # LLM hidden dimension (e.g., LLaMA-7B: 4096)
+    softplus_beta: 10.0  # Softplus sharpness (higher = closer to ReLU)
+
+# ===================================================================
+# Loss Weights & Curriculum Schedule
+# ===================================================================
+# Format: [start, end, phase_end_ratio]
+# Linear interpolation within each phase
+loss_weights:
+  # Task E: Entailment (high recall filter)
+  w_E:
+    start: 1.0
+    end: 0.5
+    phase_end_ratio: 0.3  # Decay in first 30% steps
+    description: "High at start (establish anchors), decay later (avoid over-suppression)"
+  
+  # Task S: Ranking (core prior learning)
+  w_S:
+    start: 1.0
+    end: 1.0
+    phase_end_ratio: 1.0  # Constant throughout training
+    description: "Constant weight (core task)"
+  
+  # Task C: Condensing (LLM alignment)
+  w_C:
+    start: 0.5
+    end: 1.0
+    phase_end_ratio: 0.3  # Ramp up in first 30% steps
+    description: "Low at start (unstable early), increase for posterior extraction"
+  
+  # Optional: Attention Consistency (QA/QG alignment)
+  lambda_AC:
+    value: 0.05
+    enabled: false
+    description: "Optional L2 between Primal/Dual CA weights (disabled by default)"
+  
+  # Optional: Dual Mode (QG regularization)
+  lambda_dual:
+    value: 0.2
+    enabled: false
+    description: "Optional dual task weight (disabled by default)"
+
+# Task S Curriculum Learning (teacher → posterior transition)
+curriculum_task_s:
+  # Teacher supervision (external reranker)
+  lambda_teach:
+    start: 1.0
+    end: 0.2
+    description: "High early (learn from reranker), low later (rely on posterior)"
+  
+  # Posterior alignment (LLM feedback from Task C)
+  lambda_post:
+    start: 0.0
+    end: 0.8
+    description: "Low early (no posterior yet), high later (closed loop)"
+  
+  # Tail entropy regularization
+  lambda_entropy:
+    start: 0.01
+    end: 0.001
+    description: "Prevent overconfident predictions on irrelevant fragments"
+  
+  # Temperature and alpha_gt for teacher calibration
+  tau_pred: 1.0  # Student prediction temperature
+  tau_gt: 1.0  # Teacher target temperature
+  alpha_gt: 0.7  # Teacher Top-L cumulative mass (70%)
+
+# Task C Margin Configuration
+margin_task_c:
+  mode: "adaptive"  # "fixed" or "adaptive"
+  fixed_value: 0.5  # Used if mode="fixed"
+  adaptive_ratio: 0.5  # κ in m = μ_G + κ·σ_G
+  min: 0.1  # Minimum margin
+  max: 2.0  # Maximum margin
+
+# ===================================================================
+# Optional: LQ Entropy Regularization (Prevent Attention Collapse)
+# ===================================================================
+# Encourages each LQ to attend to multiple fragments
+# Facilitates LQ compression (32→16→8) by ensuring diversity
+lq_entropy_reg:
+  # Task E: Optional (may need concentration for single-fragment answers)
+  task_e:
+    enabled: false
+    lambda_start: 0.005
+    lambda_end: 0.0005
+    target_ratio: 0.5  # Allow 50% concentration (Task E needs focus)
+  
+  # Task S: Recommended (diversity important for prior distribution)
+  task_s:
+    enabled: true
+    lambda_start: 0.01
+    lambda_end: 0.001
+    target_ratio: 0.7  # Conservative (allow 30% concentration)
+  
+  # Task C: Optional (balance diversity with posterior alignment)
+  task_c:
+    enabled: false
+    lambda_start: 0.008
+    lambda_end: 0.0001  # Fast decay to avoid posterior conflict
+    target_ratio: 0.7
+
+# ===================================================================
+# Training Hyperparameters
+# ===================================================================
+training:
+  # Optimizer
+  optimizer: "AdamW"
+  lr: 1.0e-4  # Learning rate
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  
+  # Learning rate schedule
+  lr_schedule: "cosine_with_warmup"
+  warmup_steps: 1000  # Linear warmup
+  warmup_ratio: 0.1  # Warmup 10% of total steps
+  
+  # Training duration
+  max_steps: 50000  # Total training steps
+  max_epochs: null  # Use max_steps instead
+  
+  # Batch settings
+  batch_size: 8  # Per-device batch size
+  gradient_accumulation_steps: 4  # Effective batch size = 8 * 4 = 32
+  max_grad_norm: 1.0  # Gradient clipping
+  
+  # Mixed precision
+  fp16: false
+  bf16: true  # Recommended for A100/H100
+  
+  # Data handling
+  num_workers: 4  # DataLoader workers
+  prefetch_factor: 2
+  pin_memory: true
+  
+  # Training phases (cumulative ratios)
+  phases:
+    warmup: 0.1  # First 10%: Prior-only
+    bridge: 0.7  # Next 60%: Transition
+    closed_loop: 1.0  # Last 30%: Posterior-dominated
+
+# ===================================================================
+# Data Configuration
+# ===================================================================
+data:
+  # Dataset paths
+  train_data: "data/train.json"
+  dev_data: "data/dev.json"
+  test_data: "data/test.json"
+  
+  # Fragment pool sizes (dynamic K per sample)
+  k_fragments:
+    min: 10  # Minimum fragments per sample
+    max: 5000  # Maximum fragments per sample (Task S: large pools)
+    task_e_default: 20  # Task E typical pool size
+    task_s_default: 1000  # Task S typical pool size
+    task_c_default: 100  # Task C typical pool size
+  
+  # Importance weights for Task E
+  importance_weights:
+    negative_class: 1.0  # Baseline
+    positive_class: 10.0  # Emphasize positive examples
+    longtail_positive: 50.0  # Heavily emphasize rare examples
+  
+  # Data format
+  format: "json"  # "json", "jsonl", or "hf_dataset"
+  
+  # Preprocessing
+  max_seq_length:
+    query: 128  # Max query token length
+    fragment: 256  # Max fragment token length
+    answer: 128  # Max answer token length
+
+# ===================================================================
+# Adapter Configuration (Frozen Components)
+# ===================================================================
+adapters:
+  # Retriever (frozen)
+  retriever:
+    model_name: "facebook/contriever"  # Or "sentence-transformers/all-MiniLM-L6-v2"
+    device: "cuda"
+    batch_size: 64  # Encoding batch size
+    freeze: true
+  
+  # LLM (frozen) - Task C only
+  llm:
+    model_name: "microsoft/phi-2"  # Or "meta-llama/Llama-2-7b-hf", "mistralai/Mistral-7B-v0.1"
+    device: "cuda"
+    load_in_8bit: false  # Use 8-bit quantization to save memory
+    freeze: true
+    eval_mode: true  # Always in eval mode (no gradient)
+
+# ===================================================================
+# Logging & Checkpointing
+# ===================================================================
+logging:
+  # Output directory
+  output_dir: "./outputs/joint_training"
+  run_name: "joint_e_s_c"
+  
+  # Logging frequency
+  log_interval: 10  # Log every N steps
+  eval_interval: 500  # Evaluate every N steps
+  save_interval: 1000  # Save checkpoint every N steps
+  
+  # Metrics to track
+  metrics:
+    - "loss_total"
+    - "loss_E"
+    - "loss_S"
+    - "loss_C"
+    - "loss_S_teach"
+    - "loss_S_post"
+    - "loss_S_entropy"
+    - "nll_gain"  # Task C: NLL reduction
+    - "margin"  # Task C: Adaptive margin
+    - "lambda_teach"  # Curriculum
+    - "lambda_post"  # Curriculum
+  
+  # Wandb (optional)
+  use_wandb: false
+  wandb_project: "dr-qformer-joint"
+  wandb_entity: null  # Your wandb username/team
+  
+  # TensorBoard
+  use_tensorboard: true
+  tensorboard_dir: "./outputs/joint_training/tensorboard"
+
+# ===================================================================
+# Checkpointing & Resume
+# ===================================================================
+checkpointing:
+  save_dir: "./checkpoints/joint_training"
+  save_total_limit: 5  # Keep only last 5 checkpoints
+  save_best: true  # Save best model by dev loss
+  save_optimizer_state: true
+  save_scheduler_state: true
+  resume_from: null  # Path to checkpoint to resume from
+
+# ===================================================================
+# Evaluation
+# ===================================================================
+evaluation:
+  # Evaluation datasets
+  eval_on_train: false  # Evaluate on train set (expensive)
+  eval_on_dev: true
+  eval_on_test: false  # Test set for final evaluation only
+  
+  # Metrics per task
+  task_e_metrics:
+    - "precision"
+    - "recall"
+    - "f1"
+    - "auc_roc"
+  
+  task_s_metrics:
+    - "ndcg@10"
+    - "ndcg@20"
+    - "mrr"
+    - "map"
+  
+  task_c_metrics:
+    - "nll_reduction"  # Average NLL gain
+    - "perplexity"
+    - "rouge_l"  # Optional: generation quality
+    - "bleu"  # Optional: generation quality
+
+# ===================================================================
+# Reproducibility
+# ===================================================================
+seed: 42
+deterministic: true  # Use deterministic algorithms (may be slower)
+
+# ===================================================================
+# Hardware & Performance
+# ===================================================================
+hardware:
+  device: "cuda"  # "cuda", "cpu", or "cuda:0"
+  num_gpus: 1  # Number of GPUs (distributed training not implemented yet)
+  
+  # Memory optimization
+  gradient_checkpointing: false  # Trade compute for memory
+  empty_cache_interval: 100  # Empty CUDA cache every N steps
+  
+  # Performance tuning
+  compile_model: false  # Use torch.compile (PyTorch 2.0+)
+  cudnn_benchmark: true  # cuDNN auto-tuner
