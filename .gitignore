@@ -72,3 +72,4 @@ results/
 # Examples codes
 blip2_impl_examples/
 ./blip2_impl_examples/
+*.pkl
