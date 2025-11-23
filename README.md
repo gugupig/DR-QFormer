@@ -22,8 +22,9 @@ DR-QFormer is a BLIP-2-style parameter-efficient architecture that bridges froze
 | **RankingHead (Task S)** | 0 | ✅ Complete | 6/6 |
 | **CondenseHead (Task C)** | 3.16M | ✅ Complete | 5/5 |
 | **Total Trainable** | ~60M | ✅ Ready | **16/16 passing** |
+| **Frozen Embedding Model** | ~4B | ⚠️ TODO (Qwen3-Embedding) | - |
 | **Frozen Retriever** | ~100-400M | ⚠️ Mock (TODO) | - |
-| **Frozen LLM** | ~1-10B | ⚠️ Placeholder (TODO) | - |
+| **Frozen LLM (Qwen)** | ~1-10B | ⚠️ Placeholder (TODO) | - |
 
 **Training Efficiency**: Train only ~1-2% of total system parameters!
 
@@ -53,7 +54,7 @@ Existing methods like RAG-DDR and Stochastic RAG have limitations:
 ## 🎯 Key Features
 
 - **Parameter Efficiency**: Train only ~1-2% of total parameters (Q-Former + heads ~40-90M), while keeping retriever (~100-400M) and LLM (~1-10B) frozen
-- **Frozen Components**: Retriever and LLM remain frozen throughout training - only Q-Former and task heads are trainable
+- **Frozen Components**: Embedding model (Qwen3-Embedding-4B), Retriever, and LLM (Qwen series) remain frozen throughout training - only Q-Former and task heads are trainable
 - **🔁 Prior-Posterior Feedback Loop** (Core Mechanism): 
   - **Prior** (Task S): Q-Former predicts fragment importance π(p|q) based on query
   - **Posterior** (Task C): Extract actual fragment usage q(p|q,a) from LLM attention during generation
@@ -66,14 +67,43 @@ Existing methods like RAG-DDR and Stochastic RAG have limitations:
 
 ## 📐 Architecture (Cross-Attention Design)
 
+### Q-Former Design Choice: Random Initialization + External Embeddings
+
+**Critical Decision (Post Stage-1 Experiments)**:
+- **Primary Architecture**: Fully **random-initialized Q-Former** (no pretrained backbone)
+  - Configuration: `layers=6, heads=8, hidden=768, LQs=32`
+  - **No embedding layer** - inputs are external embeddings from frozen Qwen3-Embedding-4B
+  - Advantages:
+    - No 512 token length limitation (avoids BERT constraints)
+    - Smaller parameter count (~57M vs 280M with XLM-RoBERTa backbone)
+    - Cleaner design - Q-Former only handles "attention routing + compression"
+    - Language knowledge from frozen embedding model + LLM, not Q-Former itself
+
+- **Embedding Strategy** (Critical for convergence):
+  - **Query + Evidence embeddings must use SAME frozen model** (Qwen3-Embedding-4B)
+  - Previous bug: XLM-R query embeddings + Qwen evidence embeddings → Task S failed to converge
+  - Fixed: Unified embedding source → stable training
+  
+- **XLM-RoBERTa Variant**: Retained as **ablation/backup only**
+  - Stage-1 experiments showed: XLM-R Q-Former loss curves identical to random Q-Former
+  - Conclusion: Pretrained language knowledge not needed for text-only RAG routing
+
+**Evidence Pool Scale**:
+- **Target Goal**: Handle Top-1000 retrieved passages (industrial scale)
+- **MVP Training** (Stage-1/2a): G ≤ 64 (extendable to 128, 256)
+- **Stage-3 Plan**: Specialized training for 256-1000 long-tail evidence
+- **Dynamic Subset U**: For large pools, sample `U = Top-L_teacher ∪ Top-l'_student ∪ Top-l_posterior`
+
 DR-QFormer adopts a parameter-efficient BLIP-2 paradigm adapted for **online, query-relevant RAG**:
 
 ### Workflow
 ```
-1. Retrieval:
+1. Retrieval + Embedding:
    Query → [Frozen Retriever] → Evidence Pool (P): k text fragments
                                                   ↓
-                                           P_embeds [batch, k, d]
+                            [Frozen Qwen3-Embedding-4B]
+                                                  ↓
+                                  q_embed [batch, 1, 768], P_embeds [batch, k, 768]
 
 2. Q-Former Reasoning (Cross-Attention):
    ┌─────────────────────────────────────────────────────────┐
@@ -130,18 +160,28 @@ pip install torch transformers
 
 ### Training
 
+**Current Status: Stage-1 (E+S Joint Training) Complete on MS-MARCO Subset**
+
 Train on different tasks using the provided training scripts:
 
 ```bash
-# Task E: Fragment-level Entailment Tagging (Primal + Dual)
+# Stage-1: Task E + S Joint Training (MS-MARCO smoking subset, G=1-11)
+# Note: Simplified dataset for MVP validation - no long-tail, single-hop only
 python train/task_e.py \
     --n_queries 32 \
     --hidden_dim 768 \
-    --num_layers 12 \
-    --k_fragments 10 \
-    --batch_size 4 \
-    --lr 1e-4 \
-    --epochs 10
+    --num_layers 6 \
+    --num_heads 8 \
+    --k_fragments 11 \
+    --batch_size 16 \
+    --lr 5e-5 \
+    --weight_decay 1e-3 \
+    --warmup_ratio 0.05 \
+    --grad_clip 1.0 \
+    --epochs 10 \
+    --focal_gamma 3.0 \
+    --w_pos 10.0 \
+    --w_longtail 100.0
 
 # Task S: Fragment-level Sorting Supervision (with curriculum learning)
 python train/task_s.py \
@@ -156,19 +196,52 @@ python train/task_s.py \
     --epochs 20
 
 # Task C: Condensing-Generation (Contrastive NLL, requires LLM integration)
+# Stage-2 (Future): Integrate with Qwen LLM for posterior feedback loop
 python train/task_c.py \
     --n_queries 32 \
     --llm_hidden_dim 4096 \
-    --llm_model_name "microsoft/phi-2" \
+    --llm_model_name "Qwen/Qwen-7B" \
     --softplus_beta 10.0 \
     --margin_mode adaptive \
     --margin_adaptive_ratio 0.5 \
     --batch_size 2 \
     --epochs 10
 
-# Note: Task C currently uses dummy LLM. See TASK_C_IMPLEMENTATION.md 
-# for LLM integration guide (Priority 1 in roadmap)
+# Note: Task C currently uses dummy LLM. Stage-2 will integrate real Qwen LLM
+# with MACS×LQ-CA posterior extraction. See TASK_C_IMPLEMENTATION.md.
 ```
+
+### Stage-1 Experimental Results (Random Q-Former on MS-MARCO Subset)
+
+**Key Finding**: Random-initialized Q-Former + small MLP heads achieve stable convergence:
+
+```
+Dataset: MS-MARCO smoking subset (~8k samples)
+- Evidence pool size: G = 1-11 (short, no long-tail)
+- Single-hop questions only
+- Teacher: Qwen3-Reranker-4B scores
+
+Configuration:
+- Q-Former: 6 layers, 8 heads, 768 hidden, 32 LQs
+- Batch size: 16, Epochs: 9-10
+- lr: 5e-5, AdamW, weight_decay=1e-3, warmup_ratio=0.05
+
+Results (9 epochs):
+- Total Loss:  0.229 → 0.181 (train/val parallel)
+- Task E Loss: 0.0525 → 0.0488 (train), 0.0527 → 0.050 (val)
+  - Train/val gap negligible, slight wiggle from label noise
+  - Model capacity > task difficulty (data somewhat easy)
+- Task S Loss: 0.175 → 0.131 (train), 0.168 → 0.131 (val)
+  - After fixing log-odds teacher scoring bug: clear monotonic descent
+  - Before fix: loss almost flat (P(yes) double-softmax flattened signal)
+
+Comparison: XLM-R Q-Former vs Random Q-Former
+- Loss curves nearly identical (XLM-R just slower + more memory)
+- Conclusion: Pretrained language knowledge not needed for RAG routing
+- Main line: Random Q-Former + external embedding model
+```
+
+**Next Steps**: Stage-2 (introduce Task C + LLM posterior feedback)
 
 ### Testing
 
@@ -324,6 +397,12 @@ All three tasks jointly train the Q-Former to implement the **prior-posterior fe
 
 **Purpose**: Learn **fragment-level ranking** by supervising CA attention weight distributions.
 
+**Teacher Model**: **Qwen3-Reranker-4B** (multi-choice yes/no scoring interface)
+- **Scoring Fix (Critical)**: Use `score = logit_yes - logit_no` (log-odds)
+  - Previous bug: Applied softmax to P(yes), then list-wise softmax again → flattened signal
+  - Current: Single softmax in ListNet over log-odds → clear gradient signal
+- **NoE Handling**: `noe_score = min(raw_scores) - margin`, ensures NoE has lowest probability
+
 **Architecture**:
 - Input: Pre-softmax CA raw scores from all Q-Former layers [batch, heads, N, K]
 - Processing Pipeline:
@@ -340,6 +419,7 @@ All three tasks jointly train the Q-Former to implement the **prior-posterior fe
 - ✅ JS divergence (symmetric) between student and teacher distributions
 - ✅ Posterior feedback interface (from Task C, for future integration)
 - ✅ Dual training with shared parameters
+- ✅ Stage-1 MVP: No dynamic subset U (small G=1-11), full evidence pool used
 
 **Loss**: ListNet (cross-entropy of distributions) + JS divergence (posterior feedback)
 
@@ -377,17 +457,39 @@ m = clip(μ_G + κ·σ_G, margin_min, margin_max)  # κ=0.5, [0.1, 2.0]
 L_C = (1/β) · log(1 + exp(β·(m - G)))  # β=10.0
 ```
 
-**Posterior Extraction** (for Task S feedback):
+**Posterior Extraction** (for Task S feedback) - **MACS × LQ-CA Method**:
 ```python
-# 1. Average LLM attention over answer tokens and heads
-w_lq = mean(llm_attention[answer_tokens → Z_positions])  # [batch, N_lq]
+# MACS (Attention Consistency for LLMs Explanation) customized for DR-QFormer:
 
-# 2. Multiply with CA weights (subset U only)
+# 1. Collect LLM attention: attentions[layer][batch, heads, seq_len, seq_len]
+#    - Max over heads: max_att[layer][batch, seq_len, seq_len]
+#    - Joint across layers: joint *= (alpha * att + (1-alpha))  # cumulative product
+
+# 2. Extract Key dimension slice for LQs only:
+#    joint_att_to_lqs[batch, token, lq_idx]  # token → LQ attention
+
+# 3. Span划分 (using Qwen chat template):
+#    - system_span, question_span, answer_span
+#    - Remove sink tokens (<|im_start|>, <|im_end|>, etc.)
+#    - Get: MACS_Q_to_LQ (question→LQ), MACS_A_to_LQ (answer→LQ)
+
+# 4. Aggregate answer attention to LQs:
+w_lq = mean(MACS_A_to_LQ, dim=token)  # [batch, N_lq] - "LQ importance to answer"
+
+# 5. Multiply with Q-Former CA weights (evidence → LQ):
 ca_weights_U = ca_weights[:, :, subset_indices]  # [batch, N_lq, |U|]
 
-# 3. Softmax to get posterior distribution
+# 6. Get posterior distribution over evidence:
 q_ψ_U = softmax(w_lq @ ca_weights_U)  # [batch, |U|]
+
+# Intuition: Evidence with high posterior = LQs strongly used by answer × LQs attending to that evidence
 ```
+
+**Sanity-Check Results** (Random LQs + Qwen Chat Template):
+- ✅ Different roles (user/assistant) show distinct LQ attention patterns
+- ✅ Most attention mass concentrated on single LQ (expected for untrained random LQs)
+- ✅ Heatmap visualization confirms: MACS successfully extracts token→LQ relationships
+- Ready for integration into Stage-2 training loop
 
 **Key Features**:
 - ✅ Contrastive NLL (no generative sampling, more stable than reward-based)
@@ -605,18 +707,20 @@ retriever = Retriever(model_name="facebook/contriever")
 ```
 
 ### LLMs
-**Supported** (TODO: Real integration): LLaMA-2, Mistral, Phi-2, Qwen
+**Primary Target**: **Qwen Series** (Qwen-7B, Qwen-14B) - unified ecosystem with Qwen3-Embedding + Qwen3-Reranker  
+**Alternative Support** (TODO): LLaMA-2, Mistral, other causal LMs
 ```python
 # Currently: Detailed placeholder with implementation guide
 from dr_qformer.adapters.llm import FrozenLLM
-llm = FrozenLLM(model_name="microsoft/phi-2")  # Returns dummy values
+llm = FrozenLLM(model_name="Qwen/Qwen-7B")  # Returns dummy values
 
-# TODO: Real integration (Priority 1)
+# TODO: Real Qwen integration (Priority 1 for Stage-2)
 # See TASK_C_IMPLEMENTATION.md → "LLM Integration Guide" for:
-#   - Step 1: Load LLM with transformers
-#   - Step 2: Implement Prefix-LM mask
-#   - Step 3: Register attention hooks
-#   - Step 4: Dual-path forward implementation
+#   - Step 1: Load Qwen LLM with transformers
+#   - Step 2: Implement Qwen chat template + Prefix-LM mask
+#   - Step 3: Register MACS attention hooks (all layers)
+#   - Step 4: Dual-path forward with span identification
+#   - Step 5: MACS×LQ-CA posterior extraction
 ```
 
 ### Task Heads
@@ -754,6 +858,11 @@ from dr_qformer.losses import (
 ### ⚠️ Partially Complete (Needs Real Model Integration)
 
 #### Frozen Model Adapters
+- [ ] **Embedding Model Adapter** (`dr_qformer/adapters/embedding.py`) - 0%
+  - [ ] **TODO (Priority 0)**: Integrate Qwen3-Embedding-4B
+  - [ ] **TODO**: Unified query + evidence embedding interface
+  - [ ] **CRITICAL**: Must use same embedding source for both to ensure convergence
+  
 - [x] **Retriever Adapter** (`dr_qformer/adapters/retriever.py`) - 50%
   - [x] Base interface defined
   - [x] Mock retriever for testing
@@ -763,12 +872,12 @@ from dr_qformer.losses import (
 - [x] **LLM Adapter** (`dr_qformer/adapters/llm.py`) - 60%
   - [x] Detailed placeholder with step-by-step implementation guide
   - [x] `teacher_forcing_dual_path()` interface fully specified
-  - [x] Prefix-LM mask construction logic documented
-  - [x] Attention hook registration strategy outlined
+  - [x] Prefix-LM mask + Qwen chat template logic documented
+  - [x] MACS attention hook registration strategy outlined
   - [x] Returns dummy values for testing (all Task C tests pass)
-  - [ ] **TODO**: Load real LLM (transformers.AutoModelForCausalLM)
-  - [ ] **TODO**: Implement actual dual-path forward with hooks
-  - [ ] **TODO**: Test with Phi-2/LLaMA/Mistral
+  - [ ] **TODO (Stage-2)**: Load real Qwen LLM (transformers.AutoModelForCausalLM)
+  - [ ] **TODO**: Implement MACS×LQ-CA posterior extraction with span identification
+  - [ ] **TODO**: Test with Qwen-7B/14B
 
 ---
 
@@ -812,11 +921,13 @@ from dr_qformer.losses import (
 - ✅ Comprehensive documentation for all components
 - ✅ Attention analysis tools and visualization
 
-**Next Critical Steps**:
-1. **LLM Integration** (Priority 1): Implement real LLM in `dr_qformer/adapters/llm.py`
-2. **Retriever Integration** (Priority 2): Add BGE/Contriever to `dr_qformer/adapters/retriever.py`
-3. **Real Data Pipeline** (Priority 3): Load Natural Questions or TriviaQA
-4. **End-to-End Training** (Priority 4): Joint training on real data with all three tasks
+**Next Critical Steps (Stage-2 Preparation)**:
+1. **Embedding Model Integration** (Priority 0): Implement Qwen3-Embedding-4B adapter
+2. **LLM Integration** (Priority 1): Implement Qwen LLM with MACS×LQ-CA posterior extraction
+3. **Stage-2 Training Loop** (Priority 2): E + S + C joint training with posterior feedback
+4. **Scale-Up to Larger G** (Priority 3): Test G=64→128→256 with dynamic subset U
+5. **Real Data Pipeline** (Priority 4): Extend beyond MS-MARCO to multi-hop datasets (HotpotQA)
+6. **Stage-3 Long-Tail Training** (Future): Specialize for G=256-1000 industrial scale
 
 See detailed implementation roadmap in `TASK_C_IMPLEMENTATION.md` → "Integration Roadmap" section.
 

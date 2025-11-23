@@ -3,16 +3,16 @@ DR-QFormer: BLIP-2-style Query Transformer for RAG.
 
 Cross-Attention Architecture (Online, Query-Relevant):
 - N learnable query tokens (LQs) - trainable parameters
-- Stage 1: Self-Attention (SA) - LQs fuse with q_embed or a_embed
+- Step 1: Self-Attention (SA) - LQs fuse with q_embed or a_embed
   * Input: Concat([LQs, q_embed/a_embed]) - length N+1
   * Mask: (N+1) x (N+1) all-ones (bidirectional)
   * Output: LQs_aware [N, d] (query/answer-aware LQs)
-- Stage 2: Cross-Attention (CA) - LQs_aware attend to fragment embeddings
+- Step 2: Cross-Attention (CA) - LQs_aware attend to fragment embeddings
   * Query: LQs_aware [N, d]
   * Key/Value: P_embeds [k, d] from frozen retriever
   * Mask: N x k all-ones (each LQ attends to all k fragments)
   * Output: Z [N, d] (knowledge-infused representations)
-- Stage 3: Feed-Forward Network (FFN)
+- Step 3: Feed-Forward Network (FFN)
   * Output: Z_final [N, d] → fed to task heads or frozen LLM
 
 Training:
@@ -44,21 +44,21 @@ class DRQFormer(nn.Module):
     This module serves as the ONLY trainable reasoning bridge between frozen retriever
     and frozen LLM, operating in online, query-relevant mode.
     
-    Architecture (3 Stages):
+    Architecture (3 Steps):
     =======================
-    Stage 1: Self-Attention (SA) - Make LQs query/answer-aware
+    Step 1: Self-Attention (SA) - Make LQs query/answer-aware
       - Input: Concat([LQs, q_embed]) for Primal OR Concat([LQs, a_embed]) for Dual
       - Sequence Length: N (LQs) + 1 (query or answer embedding)
       - Mask: (N+1) x (N+1) all-ones matrix (fully bidirectional)
       - Output: LQs_aware [batch, N, d] - contextualized with query/answer
     
-    Stage 2: Cross-Attention (CA) - Extract knowledge from fragments
+    Step 2: Cross-Attention (CA) - Extract knowledge from fragments
       - Query: LQs_aware [batch, N, d]
       - Key/Value: P_embeds [batch, k, d] from frozen retriever (k fragment embeddings)
       - Mask: N x k all-ones matrix (each LQ attends to all k fragments)
       - Output: Z [batch, N, d] - knowledge-infused representations
     
-    Stage 3: Feed-Forward Network (FFN)
+    Step 3: Feed-Forward Network (FFN)
       - Standard FFN with layer norm and residual connections
       - Output: Z_final [batch, N, d] → fed to task heads or frozen LLM
     
@@ -142,7 +142,7 @@ class DRQFormer(nn.Module):
         lq_drop_mask: Optional[Tensor] = None,
     ) -> Tuple[Tensor, dict]:
         """
-        Forward pass through Q-Former (3-stage cross-attention architecture).
+        Forward pass through Q-Former (3-Step cross-attention architecture).
         
         Training Modes:
         - Primal (QA): Pass query_embeds, leave answer_embeds=None
@@ -168,21 +168,22 @@ class DRQFormer(nn.Module):
                 - 'layer_outputs': List of intermediate layer outputs
                 - 'lq_drop_mask': The applied LQ drop mask (passed through or None)
         
-        Forward Pass Stages:
+        Forward Pass Steps:
         ====================
-        Stage 1: Self-Attention (SA)
+        Step 1: Self-Attention (SA)
           1. Expand LQs to batch size: [batch, N, d]
-          2. Concatenate: [LQs, query_embeds] or [LQs, answer_embeds] → [batch, N+1, d]
-          3. Apply SA layers: LQs and q/a_embed attend to each other bidirectionally
+          2. Concatenate: [LQs, query_embeds] or [LQs, answer_embeds] → [batch, N+T, d]
+             (T can be 1 for single embedding or >1 for token-level embeddings)
+          3. Apply SA layers: LQs and tokens attend to each other bidirectionally
           4. Extract LQs_aware: [batch, N, d] (first N tokens)
         
-        Stage 2: Cross-Attention (CA)
+        Step 2: Cross-Attention (CA)
           5. Query: LQs_aware [batch, N, d]
           6. Key/Value: p_embeds [batch, k, d]
           7. Apply CA layers: Each LQ attends to all k fragments
           8. Output: Z [batch, N, d] (knowledge-infused)
         
-        Stage 3: Feed-Forward Network (FFN)
+        Step 3: Feed-Forward Network (FFN)
           9. Apply FFN with residual connections
           10. Output: Z_final [batch, N, d]
         
@@ -205,13 +206,14 @@ class DRQFormer(nn.Module):
         # Select conditioning embedding (query for Primal QA, answer for Dual QG)
         cond_embed = query_embeds if query_embeds is not None else answer_embeds
         batch_size = cond_embed.size(0)
+        num_tokens = cond_embed.size(1)  # T (can be 1 or more)
         
         # Expand learnable query tokens to batch size
         # [1, N, d] → [batch, N, d]
         lqs = self.query_tokens.expand(batch_size, -1, -1).clone()
         
-        # Stage 1 Input: Concatenate [LQs, q/a_embed]
-        # [batch, N, d] + [batch, 1, d] → [batch, N+1, d]
+        # Step 1 Input: Concatenate [LQs, tokens]
+        # [batch, N, d] + [batch, T, d] → [batch, N+T, d]
         x = torch.cat([lqs, cond_embed], dim=1)
         
         # Default masks: all-ones (full attention)
@@ -302,21 +304,21 @@ class QFormerLayer(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
         
-        # Self-Attention sublayer (Stage 1)
+        # Self-Attention sublayer (Step 1)
         self.ln1 = nn.LayerNorm(hidden_dim)
         self.self_attn = nn.MultiheadAttention(
             hidden_dim, num_heads, dropout=dropout, batch_first=True
         )
         self.dropout1 = nn.Dropout(dropout)
         
-        # Cross-Attention sublayer (Stage 2)
+        # Cross-Attention sublayer (Step 2)
         self.ln2 = nn.LayerNorm(hidden_dim)
         self.cross_attn = nn.MultiheadAttention(
             hidden_dim, num_heads, dropout=dropout, batch_first=True
         )
         self.dropout2 = nn.Dropout(dropout)
         
-        # Feed-Forward Network sublayer (Stage 3)
+        # Feed-Forward Network sublayer (Step 3)
         self.ln3 = nn.LayerNorm(hidden_dim)
         self.ffn = nn.Sequential(
             nn.Linear(hidden_dim, 4 * hidden_dim),
@@ -355,7 +357,7 @@ class QFormerLayer(nn.Module):
                 - ca_raw_scores_per_head: [batch, num_heads, N, k] pre-softmax logits
                 - ca_raw_scores_avg: [batch, N, k] head-averaged raw scores
         """
-        # Stage 1: Self-Attention (SA) - LQs fuse with q/a_embed
+        # Step 1: Self-Attention (SA) - LQs fuse with q/a_embed
         # Input: Concat([LQs, q/a_embed]) [batch, N+1, d]
         x_norm = self.ln1(x)
         
@@ -380,7 +382,7 @@ class QFormerLayer(nn.Module):
         lqs_aware = x[:, :n_lqs, :]  # [batch, N, d]
         qa_embed = x[:, n_lqs:, :]   # [batch, 1, d] - preserve q/a embedding
         
-        # Stage 2: Cross-Attention (CA) - LQs_aware attend to fragments
+        # Step 2: Cross-Attention (CA) - LQs_aware attend to fragments
         # Compute raw CA scores (pre-softmax) manually for Task E
         ca_weights = None
         ca_raw_scores_per_head = None
@@ -446,7 +448,7 @@ class QFormerLayer(nn.Module):
             
             lqs_aware = lqs_aware + self.dropout2(ca_out)  # Residual connection
         
-        # Stage 3: Feed-Forward Network (FFN)
+        # Step 3: Feed-Forward Network (FFN)
         lqs_norm2 = self.ln3(lqs_aware)
         ffn_out = self.ffn(lqs_norm2)
         lqs_aware = lqs_aware + self.dropout3(ffn_out)  # Residual connection

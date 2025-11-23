@@ -281,39 +281,37 @@ class XLMRobertaDRQFormer(nn.Module):
     Args:
         xlm_model_name (str): HuggingFace model name. Default: "xlm-roberta-base"
         n_queries (int): Number of learnable query tokens (LQs). Default: 32
-        hidden_dim (int): Hidden dimension (d). Should match XLM-R's hidden_size (768). Default: 768
-        num_heads (int): Number of attention heads. Should match XLM-R's num_attention_heads. Default: 12
         dropout (float): Dropout rate. Default: 0.1
         use_ca_layers (List[int] | None): Layer indices where CA is applied (0-indexed).
                                            If None, CA is applied after every layer.
                                            Example: [5, 11] applies CA after layer 6 and 12 only.
         freeze_xlmr (bool): If True, freeze XLM-R weights (only train LQs and CA). Default: False
+        bypass_embeddings (bool): If True, expect pre-computed embeddings instead of input_ids. Default: False
     """
     
     def __init__(
         self,
-        xlm_model_name: str = "xlm-roberta-base",
+        xlm_model_name: str = "FacebookAI/xlm-roberta-base",
         n_queries: int = 32,
-        hidden_dim: int = 768,
-        num_heads: int = 12,
         dropout: float = 0.1,
         use_ca_layers: Optional[List[int]] = None,
         freeze_xlmr: bool = False,
+        bypass_embeddings: bool = False,
     ):
         super().__init__()
         self.n_queries = n_queries
-        self.hidden_dim = hidden_dim
-        self.num_heads = num_heads
+        self.bypass_embeddings = bypass_embeddings
         
         # Load pretrained XLM-RoBERTa model
         print(f"Loading XLM-RoBERTa model: {xlm_model_name}")
         self.xlmr = AutoModel.from_pretrained(xlm_model_name)
         
-        # Verify dimensions match
-        assert self.xlmr.config.hidden_size == hidden_dim, \
-            f"hidden_dim ({hidden_dim}) must match XLM-R hidden_size ({self.xlmr.config.hidden_size})"
-        assert self.xlmr.config.num_attention_heads == num_heads, \
-            f"num_heads ({num_heads}) must match XLM-R num_attention_heads ({self.xlmr.config.num_attention_heads})"
+        # Automatically get dimensions from XLM-R config
+        self.hidden_dim = self.xlmr.config.hidden_size  # e.g., 768 for base, 1024 for large
+        self.num_heads = self.xlmr.config.num_attention_heads  # e.g., 12 for base, 16 for large
+        
+        print(f"  ✓ Hidden dim: {self.hidden_dim} (from XLM-R config)")
+        print(f"  ✓ Num heads: {self.num_heads} (from XLM-R config)")
         
         # Extract embeddings and encoder layers
         self.embeddings = self.xlmr.embeddings
@@ -321,8 +319,9 @@ class XLMRobertaDRQFormer(nn.Module):
         self.num_xlmr_layers = len(self.encoder_layers)
         
         # Learnable query tokens (LQs) - core trainable parameters
-        self.query_tokens = nn.Parameter(torch.randn(1, n_queries, hidden_dim))
-        nn.init.normal_(self.query_tokens, mean=0.0, std=0.02)
+        # Following BLIP-2: Initialize with normal distribution
+        self.query_tokens = nn.Parameter(torch.randn(1, n_queries, self.hidden_dim))
+        nn.init.normal_(self.query_tokens, mean=0.0, std=self.xlmr.config.initializer_range)
         
         # Cross-Attention layers (optional per layer)
         if use_ca_layers is None:
@@ -331,13 +330,17 @@ class XLMRobertaDRQFormer(nn.Module):
         
         self.use_ca_layers = use_ca_layers
         self.cross_layers = nn.ModuleList([
-            QueryEvidenceCrossAttention(hidden_dim, num_heads, dropout)
+            QueryEvidenceCrossAttention(self.hidden_dim, self.num_heads, dropout)
             if i in use_ca_layers else None
             for i in range(self.num_xlmr_layers)
         ])
         
+        # BLIP-2 Initialization: Copy self-attention weights to cross-attention query branch
+        # This provides a better initialization point than random weights
+        self._init_cross_attention_from_self_attention()
+        
         # Final LayerNorm (following BLIP-2 design)
-        self.final_ln = nn.LayerNorm(hidden_dim)
+        self.final_ln = nn.LayerNorm(self.hidden_dim)
         
         # Optional: freeze XLM-R backbone
         if freeze_xlmr:
@@ -354,6 +357,71 @@ class XLMRobertaDRQFormer(nn.Module):
         print(f"  - Trainable params: {self.count_parameters():,}")
         print(f"  - XLM-R frozen: {freeze_xlmr}")
     
+    def _init_cross_attention_from_self_attention(self):
+        """
+        BLIP-2 Initialization Strategy: Copy self-attention weights to cross-attention.
+        
+        This provides a better initialization point than random weights by leveraging
+        the pre-trained self-attention knowledge from XLM-RoBERTa.
+        
+        Specifically, for each cross-attention layer:
+        1. Copy Q projection weights from corresponding self-attention layer
+        2. K/V projections remain random (will attend to evidence, different from text)
+        3. This warm-starts the query projection with linguistic knowledge
+        
+        Reference: BLIP-2 paper Section 3.1 and official implementation
+        https://github.com/salesforce/LAVIS/blob/main/lavis/models/blip2_models/blip2_qformer.py#L80-L85
+        """
+        print("\n🔄 Initializing Cross-Attention layers from Self-Attention weights (BLIP-2 style)...")
+        
+        for layer_idx, ca_layer in enumerate(self.cross_layers):
+            if ca_layer is not None:
+                # Get corresponding XLM-R layer
+                xlmr_layer = self.encoder_layers[layer_idx]
+                xlmr_self_attn = xlmr_layer.attention.self
+                
+                # Copy Q projection weights: self-attention -> cross-attention
+                # This transfers linguistic understanding to the CA query branch
+                try:
+                    # PyTorch MultiheadAttention has combined in_proj_weight: [3*hidden_dim, hidden_dim]
+                    # Layout: [Q_weight; K_weight; V_weight] stacked vertically
+                    # We copy Q weights (first hidden_dim rows) from XLM-R self-attention
+                    
+                    if hasattr(ca_layer.cross_attn, 'in_proj_weight') and ca_layer.cross_attn.in_proj_weight is not None:
+                        # Combined projection (default for nn.MultiheadAttention)
+                        ca_layer.cross_attn.in_proj_weight.data[:self.hidden_dim, :].copy_(
+                            xlmr_self_attn.query.weight.data
+                        )
+                        
+                        if ca_layer.cross_attn.in_proj_bias is not None and xlmr_self_attn.query.bias is not None:
+                            ca_layer.cross_attn.in_proj_bias.data[:self.hidden_dim].copy_(
+                                xlmr_self_attn.query.bias.data
+                            )
+                        
+                        print(f"  ✅ Layer {layer_idx}: Copied Q weights (combined projection)")
+                    
+                    elif hasattr(ca_layer.cross_attn, 'q_proj_weight'):
+                        # Separate projections (if using _qkv_same_embed_dim=False)
+                        ca_layer.cross_attn.q_proj_weight.data.copy_(
+                            xlmr_self_attn.query.weight.data
+                        )
+                        
+                        if hasattr(ca_layer.cross_attn, 'in_proj_bias') and ca_layer.cross_attn.in_proj_bias is not None:
+                            ca_layer.cross_attn.in_proj_bias.data[:self.hidden_dim].copy_(
+                                xlmr_self_attn.query.bias.data
+                            )
+                        
+                        print(f"  ✅ Layer {layer_idx}: Copied Q weights (separate projection)")
+                    
+                    else:
+                        print(f"  ⚠️  Layer {layer_idx}: Unknown projection structure, using random init")
+                
+                except Exception as e:
+                    print(f"  ⚠️  Layer {layer_idx}: Could not copy weights ({type(e).__name__}: {e})")
+                    print(f"       Using random initialization instead")
+        
+        print("✅ Cross-Attention initialization complete!\n")
+    
     def count_parameters(self):
         """Count trainable parameters."""
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -364,6 +432,7 @@ class XLMRobertaDRQFormer(nn.Module):
         attention_mask: Tensor,
         evidence_emb: Tensor,
         evidence_mask: Optional[Tensor] = None,
+        precomputed_query_emb: Optional[Tensor] = None,
     ) -> Tuple[Tensor, List[Dict]]:
         """
         Forward pass through XLM-RoBERTa-based DR-QFormer (BLIP-2 Style).
@@ -402,9 +471,14 @@ class XLMRobertaDRQFormer(nn.Module):
         batch_size = input_ids.size(0)
         seq_len = input_ids.size(1)  # T
         
-        # Step 1: Get token embeddings from XLM-RoBERTa embeddings
-        # This includes word embeddings + position embeddings + token_type embeddings
-        token_emb = self.embeddings(input_ids)  # [B, T, d]
+        # Step 1: Get token embeddings
+        if self.bypass_embeddings and precomputed_query_emb is not None:
+            # Use pre-computed token embeddings (from Qwen3 or other models)
+            # This bypasses XLM-R's embedding layer entirely
+            token_emb = precomputed_query_emb  # [B, T, d]
+        else:
+            # Use XLM-RoBERTa embeddings (word + position + token_type)
+            token_emb = self.embeddings(input_ids)  # [B, T, d]
         
         # Step 2: Expand learnable query tokens to batch size
         lqs = self.query_tokens.expand(batch_size, -1, -1)  # [B, N, d]
@@ -468,9 +542,13 @@ class XLMRobertaDRQFormer(nn.Module):
         """
         Convert attention mask to XLM-R's expected format.
         
-        Input: [B, seq_len] with 1=valid, 0=padding
+        Input: [B, seq_len] with True/1=valid, False/0=padding (bool or int)
         Output: [B, 1, 1, seq_len] with 0=valid, -10000=padding (additive mask)
         """
+        # Convert to float if bool type
+        if attention_mask.dtype == torch.bool:
+            attention_mask = attention_mask.float()
+        
         # Expand dimensions: [B, seq_len] -> [B, 1, 1, seq_len]
         extended_mask = attention_mask.unsqueeze(1).unsqueeze(2)
         
@@ -528,8 +606,6 @@ if __name__ == "__main__":
     model = XLMRobertaDRQFormer(
         xlm_model_name="xlm-roberta-base",
         n_queries=n_queries,
-        hidden_dim=hidden_dim,
-        num_heads=num_heads,
         dropout=0.1,
         use_ca_layers=[5, 11],  # Apply CA only after layers 6 and 12
         freeze_xlmr=False,

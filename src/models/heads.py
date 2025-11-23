@@ -64,7 +64,7 @@ class EntailmentHead(nn.Module):
         p_drop_lq: float = 0.1,
         focal_gamma: float = 2.0,
         focal_alpha: float = 0.25,
-        hidden_dim: Optional[int] = None  # Accepted for API compatibility, ignored
+        hidden_dim: Optional[int] = None  # Q-Former hidden dimension (REQUIRED for BLIP-2 style)
     ):
         super().__init__()
         self.num_fragments = num_fragments  # Only used as hint, not enforced
@@ -73,19 +73,43 @@ class EntailmentHead(nn.Module):
         self.focal_gamma = focal_gamma
         self.focal_alpha = focal_alpha
         
-        # NOTE: hidden_dim is accepted but ignored - raw scores don't need it
-        # For dynamic K_pool support, we cannot use fixed-size LayerNorm
-        # Instead, we'll use manual normalization (mean/std) in forward pass
-        # This allows variable K per batch without dimension mismatch
-        self.eps = 1e-5  # For numerical stability in normalization
+        # BLIP-2 Style: Learnable task-specific projection head
+        # This allows the model to learn which aspects of Q-Former output are relevant for entailment
+        if hidden_dim is None:
+            raise ValueError("hidden_dim is required for EntailmentHead (BLIP-2 paradigm)")
         
-        print(f"EntailmentHead initialized:")
+        self.hidden_dim = hidden_dim
+        
+        # Task-specific MLP: Z [B, N, hidden_dim] → fragment scores [B, K]
+        # Architecture: Pooling → MLP → Projection
+        # 1. Attention-weighted pooling over N learnable queries (learned weights)
+        self.query_attention = nn.Linear(hidden_dim, 1)  # Compute attention weights for N queries
+        
+        # 2. MLP for task-specific transformation
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim // 2, hidden_dim // 4),
+            nn.GELU(),
+            nn.Dropout(0.1),
+        )
+        
+        # 3. Final projection to fragment logits (will be dynamically sized)
+        # NOTE: We can't pre-define output size due to dynamic K
+        # Instead, we'll use a vector that broadcasts across K
+        self.fragment_scorer = nn.Linear(hidden_dim // 4, 1)  # Score per fragment
+        
+        # For numerical stability in manual normalization
+        self.eps = 1e-5
+        
+        print(f"EntailmentHead initialized (BLIP-2 Style with Learnable Projection):")
+        print(f"  - hidden_dim: {hidden_dim}")
         print(f"  - tau (temperature): {tau}")
         print(f"  - p_drop_lq: {p_drop_lq}")
         print(f"  - focal_gamma: {focal_gamma}")
         print(f"  - focal_alpha: {focal_alpha}")
-        if hidden_dim is not None:
-            print(f"  - hidden_dim provided ({hidden_dim}) but ignored (using raw scores)")
+        print(f"  ✨ Added learnable projection: {hidden_dim} → {hidden_dim//2} → {hidden_dim//4} → 1")
     
     def forward(
         self, 
@@ -125,70 +149,116 @@ class EntailmentHead(nn.Module):
         3. Apply Drop-LQ regularization (training only)
         4. LogSumExp aggregation over N LQs → [batch, k]
         """
-        if ca_raw_scores_per_head is None or len(ca_raw_scores_per_head) == 0:
-            raise ValueError("ca_raw_scores_per_head is required for EntailmentHead")
+        if z is None:
+            raise ValueError("z (Q-Former output) is required for EntailmentHead")
         
-        # ca_raw_scores_per_head: list of [batch, num_heads, N, k], one per layer
-        # Step 1: Process each layer independently
-        normalized_layers = []
+        # z: [batch, N, hidden_dim] - Q-Former learnable query outputs
+        batch_size, N, hidden_dim = z.shape
         
-        for layer_idx, ca_raw in enumerate(ca_raw_scores_per_head):
-            # ca_raw: [batch, num_heads, N, k]
-            batch_size, num_heads, n_lqs, k = ca_raw.shape
-            
-            # Step 1a: Apply pool_padding_mask BEFORE LayerNorm
-            # mask: [batch, k] → [batch, 1, 1, k] for broadcasting
-            if pool_padding_mask is not None:
-                mask_expanded = pool_padding_mask.unsqueeze(1).unsqueeze(2)  # [batch, 1, 1, k]
-                ca_raw_masked = ca_raw.masked_fill(~mask_expanded, -1e4)
-            else:
-                ca_raw_masked = ca_raw
-            
-            # Step 1b: Manual normalization per head on last dimension (k fragments)
-            # This supports dynamic K_pool without fixed-size LayerNorm
-            # Normalize along K dimension: (x - mean) / sqrt(var + eps)
-            mean = ca_raw_masked.mean(dim=-1, keepdim=True)  # [batch, num_heads, N, 1]
-            var = ca_raw_masked.var(dim=-1, keepdim=True, unbiased=False)  # [batch, num_heads, N, 1]
-            norm_scores = (ca_raw_masked - mean) / torch.sqrt(var + self.eps)  # [batch, num_heads, N, k]
-            
-            # Step 1c: Average over heads → [batch, N, k]
-            layer_scores_avg = norm_scores.mean(dim=1)
-            normalized_layers.append(layer_scores_avg)
-        
-        # Step 2: Aggregate across layers (mean)
-        ca_scores_stacked = torch.stack(normalized_layers, dim=0)  # [num_layers, batch, N, k]
-        ca_scores_avg = ca_scores_stacked.mean(dim=0)  # [batch, N, k]
-        
-        # Step 3: Drop-LQ regularization (training only)
+        # BLIP-2 Style Pipeline:
+        # =====================
+        # Step 1: Apply Drop-LQ regularization (training only)
         if training:
             if lq_drop_mask is not None:
                 # Use external unified mask (for multi-task training)
-                ca_scores_dropped = self._apply_drop_lq(ca_scores_avg, mask=lq_drop_mask)
+                z_dropped = self._apply_drop_lq_on_z(z, mask=lq_drop_mask)
             elif self.p_drop_lq > 0:
                 # Use internal random mask (for single-task training)
-                ca_scores_dropped = self._apply_drop_lq(ca_scores_avg, mask=None)
+                z_dropped = self._apply_drop_lq_on_z(z, mask=None)
             else:
-                ca_scores_dropped = ca_scores_avg
+                z_dropped = z
         else:
-            ca_scores_dropped = ca_scores_avg
+            z_dropped = z
         
-        # Step 4: LogSumExp aggregation over N LQs → [batch, k]
-        fragment_logits = self._logsumexp_aggregate(ca_scores_dropped)
+        # Step 2: Compute attention weights over N learnable queries
+        # This learns "which query embeddings are most important for entailment"
+        query_attn_logits = self.query_attention(z_dropped).squeeze(-1)  # [batch, N]
+        query_attn_weights = torch.softmax(query_attn_logits, dim=1)  # [batch, N]
         
-        # Step 5: Apply final pool_padding_mask to output logits
-        # This ensures padding fragments have very negative logits (will be ignored in BCE loss)
+        # Step 3: Attention-weighted pooling → [batch, hidden_dim]
+        pooled_z = torch.einsum('bn,bnh->bh', query_attn_weights, z_dropped)  # [batch, hidden_dim]
+        
+        # Step 4: Task-specific MLP transformation
+        transformed = self.mlp(pooled_z)  # [batch, hidden_dim // 4]
+        
+        # Step 5: Use CA attention scores to modulate per-fragment predictions
+        # This combines learned representation (from Z) with attention patterns (from CA)
+        if ca_raw_scores_per_head is not None and len(ca_raw_scores_per_head) > 0:
+            # Extract attention-based fragment relevance scores
+            ca_raw = ca_raw_scores_per_head[-1]  # Use last layer: [batch, num_heads, N, k]
+            _, _, _, k = ca_raw.shape
+            
+            # Average over heads and queries to get fragment importance
+            ca_fragment_scores = ca_raw.mean(dim=(1, 2))  # [batch, k]
+            
+            # Normalize CA scores per sample
+            if pool_padding_mask is not None:
+                ca_fragment_scores = ca_fragment_scores.masked_fill(~pool_padding_mask, -1e9)
+            ca_fragment_scores = torch.softmax(ca_fragment_scores, dim=-1)  # [batch, k]
+        else:
+            # Fallback: uniform attention (shouldn't happen in practice)
+            k = 10  # Default, will be overridden by pool_padding_mask shape
+            if pool_padding_mask is not None:
+                k = pool_padding_mask.shape[1]
+            ca_fragment_scores = torch.ones(batch_size, k, device=z.device) / k
+        
+        # Step 6: Combine learned representation with attention scores
+        # Broadcast transformed features across fragments and modulate by attention
+        transformed_expanded = transformed.unsqueeze(1).expand(-1, k, -1)  # [batch, k, hidden_dim//4]
+        
+        # Project to scalar logits per fragment
+        fragment_logits_raw = self.fragment_scorer(transformed_expanded).squeeze(-1)  # [batch, k]
+        
+        # Modulate by attention scores (multiplicative gating)
+        fragment_logits = fragment_logits_raw * ca_fragment_scores * self.tau  # [batch, k]
+        
+        # Step 7: Apply final pool_padding_mask to output logits
         if pool_padding_mask is not None:
             fragment_logits = fragment_logits.masked_fill(~pool_padding_mask, -1e4)
         
-        # For debug outputs: keep the first layer's per-head scores (before normalization)
+        # For debug outputs
         ca_raw_first_layer = ca_raw_scores_per_head[0] if ca_raw_scores_per_head else None
         
         # Return dict with debug outputs
         return {
             'fragment_logits': fragment_logits,
-            'ca_raw_scores_avg': ca_scores_avg.detach(),  # [batch, N, k] layer-aggregated normalized scores
+            'ca_raw_scores_avg': pooled_z.detach() if pooled_z is not None else None,  # [batch, hidden_dim] pooled representation
             'ca_raw_scores_per_head': ca_raw_first_layer.detach() if ca_raw_first_layer is not None else None  # [batch, num_heads, N, k] first layer raw
         }
+    
+    def _apply_drop_lq_on_z(self, z: Tensor, mask: Optional[Tensor] = None) -> Tensor:
+        """
+        Apply Drop-LQ regularization on Q-Former output Z.
+        
+        Args:
+            z: [batch, N, hidden_dim] Q-Former output
+            mask: [batch, N, 1] optional external mask (True=keep, False=drop)
+        
+        Returns:
+            z_dropped: [batch, N, hidden_dim] with some LQs zeroed out
+        """
+        batch_size, n_lqs, hidden_dim = z.shape
+        device = z.device
+        
+        if mask is not None:
+            # Use external unified mask
+            mask_drop = mask.float()  # [batch, N, 1]
+        else:
+            # Generate internal dropout mask
+            mask_drop = torch.bernoulli(
+                torch.full((batch_size, n_lqs, 1), 1.0 - self.p_drop_lq, device=device)
+            )
+            
+            # Safety: prevent all LQs being dropped
+            all_dropped = (mask_drop.sum(dim=1, keepdim=True) == 0)
+            if all_dropped.any():
+                for b in range(batch_size):
+                    if all_dropped[b, 0, 0]:
+                        random_idx = int(torch.randint(0, n_lqs, (1,), device=device).item())
+                        mask_drop[b, random_idx, 0] = 1.0
+        
+        # Zero out dropped LQs
+        return z * mask_drop
     
     def _apply_drop_lq(self, ca_scores: Tensor, mask: Optional[Tensor] = None) -> Tensor:
         """
