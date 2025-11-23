@@ -55,7 +55,7 @@ class FrozenLLM:
         model_name: str = r"E:\drag_datasets\llms\Qwen3-4B-Instruct-2507",
         device: str = "cuda",
         freeze: bool = True,
-        max_length: int = 256,
+        max_length: int = 1024,
         torch_dtype: Optional[torch.dtype] = None,
         attn_implementation: str = "eager",
     ):

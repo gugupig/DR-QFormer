@@ -17,12 +17,12 @@ DR-QFormer is a BLIP-2-style parameter-efficient architecture that bridges froze
 
 | Component | Parameters | Status | Tests |
 |-----------|-----------|--------|-------|
-| **Q-Former Core** | 56.7M | ✅ Complete | 8/8 |
-| **EntailmentHead (Task E)** | 10 | ✅ Complete | 5/5 + 8/8 spec |
+| **Q-Former Core** | ~57M (6 layers) | ✅ Complete | 8/8 |
+| **EntailmentHead (Task E)** | ~200K (learnable projection) | ✅ Complete | 5/5 + 8/8 spec |
 | **RankingHead (Task S)** | 0 | ✅ Complete | 6/6 |
 | **CondenseHead (Task C)** | 3.16M | ✅ Complete | 5/5 |
 | **Total Trainable** | ~60M | ✅ Ready | **16/16 passing** |
-| **Frozen Embedding Model** | ~4B | ⚠️ TODO (Qwen3-Embedding) | - |
+| **Frozen Embedding Model** | ~4B | ❌ Not Implemented (Qwen3-Embedding) | - |
 | **Frozen Retriever** | ~100-400M | ⚠️ Mock (TODO) | - |
 | **Frozen LLM (Qwen)** | ~1-10B | ⚠️ Placeholder (TODO) | - |
 
@@ -172,16 +172,16 @@ python train/task_e.py \
     --hidden_dim 768 \
     --num_layers 6 \
     --num_heads 8 \
-    --k_fragments 11 \
-    --batch_size 16 \
-    --lr 5e-5 \
-    --weight_decay 1e-3 \
-    --warmup_ratio 0.05 \
-    --grad_clip 1.0 \
+    --k_fragments 5 \
+    --batch_size 8 \
+    --lr 1e-4 \
     --epochs 10 \
-    --focal_gamma 3.0 \
+    --focal_gamma 2.0 \
+    --focal_alpha 0.25 \
     --w_pos 10.0 \
-    --w_longtail 100.0
+    --w_longtail 50.0 \
+    --train_data <path_to_train_data> \
+    --dev_data <path_to_dev_data>
 
 # Task S: Fragment-level Sorting Supervision (with curriculum learning)
 python train/task_s.py \
@@ -286,15 +286,17 @@ python eval/evaluate.py --checkpoint path/to/checkpoint.ckpt --test_data data/te
 ## 📁 Project Structure
 
 ```
-dr_qformer/                         # Core package
+src/                                # Core package (renamed from dr_qformer)
   models/
-    qformer.py                      # DR-QFormer core (56.7M params, 12 layers × 8 heads)
-    heads.py                        # Task heads: EntailmentHead (10 params)
+    qformer_random_init.py          # DR-QFormer core with random init (default, ~57M params, 6 layers × 8 heads)
+    qformer_xlm.py                  # XLM-RoBERTa variant (ablation only)
+    heads.py                        # Task heads: EntailmentHead (~200K params, BLIP-2 style projection)
                                     #             FragmentRankingHead (0 params)
                                     #             CondenseHead (3.16M params)
   adapters/
     retriever.py                    # Frozen retriever adapter (mock + TODO real integration)
     llm.py                          # Frozen LLM adapter (detailed placeholder + TODO)
+    # embedding.py                  # ❌ TODO: Qwen3-Embedding-4B adapter (Priority 0)
   data/
     interfaces.py                   # Data structures (Fragment, Example, Dataset)
     collate.py                      # Batch collation: collate_task_e/s/c
@@ -364,16 +366,20 @@ All three tasks jointly train the Q-Former to implement the **prior-posterior fe
 
 **Purpose**: Learn "answerability/entailment" to act as a **fragment-level filter/tagger**.
 
-**Architecture** (Spec v1.1):
-- Input: Pre-softmax CA raw scores (QKᵀ/√d) from all Q-Former layers [batch, heads, N, K]
+**Architecture** (Spec v1.1 + BLIP-2 Style Projection):
+- Input: Q-Former output Z [batch, N, hidden_dim]
 - Processing Pipeline:
+  1. Attention-weighted pooling over N learnable queries
+  2. MLP transformation: hidden_dim → hidden_dim/2 → hidden_dim/4
+  3. Fragment scorer projection → [batch, K] logits
+- Alternative path (for ablation): Direct CA attention score aggregation:
   1. Layer-wise normalization per-head (manual μ/σ, supports dynamic K)
   2. Head averaging → [batch, N, K]
   3. Layer averaging → [batch, N, K]
-  4. Drop-LQ aggregation (training only, p=0.2) → [batch, K]
+  4. Drop-LQ aggregation (training only, p=0.1) → [batch, K]
   5. LSE pooling (τ=0.5) → [batch, K] fragment logits
 - Output: K logits [batch, K] - binary entailment scores per fragment
-- Head Parameters: **10 trainable params** (LSE temperature τ only)
+- Head Parameters: **~200K trainable params** (learnable projection layers)
 
 **Key Features**:
 - ✅ Uses raw QKᵀ scores before softmax (exposes attention computation)
@@ -619,7 +625,7 @@ Target format for `configs/drqf_qa.yaml`:
 model:
   n_queries: 32              # Learnable query tokens (LQs)
   hidden_dim: 768            # Q-Former hidden dimension  
-  num_layers: 12             # Default: 12 layers
+  num_layers: 6              # Default: 6 layers (12 for ablation studies)
   num_heads: 8               # 8 heads per layer
 
 task_e:                      # Entailment tagging
@@ -728,34 +734,37 @@ llm = FrozenLLM(model_name="Qwen/Qwen-7B")  # Returns dummy values
 ```python
 from dr_qformer.models.heads import EntailmentHead, FragmentRankingHead, CondenseHead
 
-# Task E: 10 trainable params (LSE temperature)
+# Task E: ~200K trainable params (BLIP-2 style learnable projection)
 entailment_head = EntailmentHead(
-    n_queries=32,
-    num_layers=12,
-    num_heads=8,
-    tau=0.5,
-    drop_lq_prob=0.2
+    hidden_dim=768,           # Required: Q-Former hidden dimension
+    num_fragments=10,         # Hint only, supports dynamic K
+    tau=0.5,                  # LSE temperature
+    p_drop_lq=0.1,            # Drop-LQ probability (default 0.1)
+    focal_gamma=2.0,
+    focal_alpha=0.25
 )
 
-# Task S: 0 trainable params (pure attention)
+# Task S: 0 trainable params (pure attention aggregation)
 ranking_head = FragmentRankingHead(
     n_queries=32,
-    num_layers=12,
+    num_layers=6,             # Match Q-Former layers
     num_heads=8,
     tau_head=0.1,
     tau_lq=0.2
 )
 
-# Task C: 3.16M trainable params (projection)
+# Task C: 3.16M trainable params (projection to LLM dimension)
 condense_head = CondenseHead(
-    hidden_dim=768,
-    llm_hidden_dim=4096
+    hidden_dim=768,           # Q-Former dimension
+    llm_hidden_dim=4096       # LLM dimension (e.g., Qwen-7B)
 )
 
 # Custom Head: Extend base class
 class CustomHead(nn.Module):
-    def forward(self, ca_raw_scores_per_head, pool_padding_mask, training=False):
-        # Your logic: aggregate attention scores, apply masks, etc.
+    def forward(self, z=None, ca_raw_scores_per_head=None, pool_padding_mask=None, training=False):
+        # z: Q-Former output [batch, N, hidden_dim]
+        # ca_raw_scores_per_head: attention scores (if needed)
+        # Your logic here
         return output_dict
 ```
 
@@ -777,37 +786,38 @@ from dr_qformer.losses import (
 ### ✅ Completed (Production Ready)
 
 #### Core Architecture
-- [x] **Q-Former Core** (`dr_qformer/models/qformer.py`) - 56.7M params
+- [x] **Q-Former Core** (`src/models/qformer_random_init.py`, `qformer_xlm.py`) - ~57M params (6 layers default)
   - [x] SA → CA → FFN three-stage architecture
   - [x] Manual Q,K,V projection exposing pre-softmax scores
   - [x] Primal (QA) and Dual (QG) mode support
   - [x] Dynamic K support (no fixed dimension dependencies)
   - [x] Padding mask propagation through all layers
   - [x] Per-layer raw scores export: `ca_raw_scores_per_head` [B,H,N,K], `ca_raw_scores_avg` [B,N,K]
-  - [x] 12 layers × 8 heads, comprehensive attention weight logging
+  - [x] Default: 6 layers × 8 heads (12 layers for ablation studies)
 
 #### Task Heads (All Three Tasks)
-- [x] **Task E: EntailmentHead** (`dr_qformer/models/heads.py`) - 10 params
-  - [x] Layer-wise normalization → Head-mean → Layer-mean → Drop-LQ → LSE(τ=0.5)
+- [x] **Task E: EntailmentHead** (`src/models/heads.py`) - ~200K params (BLIP-2 style)
+  - [x] Learnable projection: hidden_dim → hidden_dim/2 → hidden_dim/4 → 1
+  - [x] Alternative path: Layer-wise normalization → Head-mean → Layer-mean → Drop-LQ → LSE(τ=0.5)
   - [x] Dynamic K, padding mask support
   - [x] Spec v1.1 fully compliant (8/8 acceptance criteria)
-- [x] **Task S: FragmentRankingHead** (`dr_qformer/models/heads.py`) - 0 params
+- [x] **Task S: FragmentRankingHead** (`src/models/heads.py`) - 0 params
   - [x] Dual-level LSE aggregation (τ_head=0.1, τ_lq=0.2)
   - [x] Pure attention mechanism, no trainable parameters
-- [x] **Task C: CondenseHead** (`dr_qformer/models/heads.py`) - 3.16M params
+- [x] **Task C: CondenseHead** (`src/models/heads.py`) - 3.16M params
   - [x] Linear projection (768→4096) + LayerNorm
   - [x] LLM dimension adaptation
 
 #### Loss Functions
-- [x] **Task E: Focal Loss** (`dr_qformer/losses.py`)
+- [x] **Task E: Focal Loss** (`src/losses.py`)
   - [x] Dynamic importance weighting (w_pos=10.0, w_longtail=50.0)
   - [x] Padding mask integration
-- [x] **Task S: ListNet + JS Divergence** (`dr_qformer/losses.py`)
+- [x] **Task S: ListNet + JS Divergence** (`src/losses.py`)
   - [x] α_gt constraint via binary search (Top-L mass calibration)
   - [x] Dynamic subset construction (Teacher Top-L ∪ Hard Negatives)
   - [x] Curriculum learning scheduler (λ_teacher, λ_posterior)
   - [x] Posterior feedback interface
-- [x] **Task C: Contrastive NLL** (`dr_qformer/losses.py`)
+- [x] **Task C: Contrastive NLL** (`src/losses.py`)
   - [x] Softplus loss with adaptive/fixed margin
   - [x] Posterior extraction from LLM attention
   - [x] Subset-only posterior computation
@@ -827,11 +837,11 @@ from dr_qformer.losses import (
   - [x] Full training loop ready
 
 #### Data & Utilities
-- [x] **Collate Functions** (`dr_qformer/data/collate.py`)
+- [x] **Collate Functions** (`src/data/collate.py`)
   - [x] `collate_task_e`: Padding mask + importance_weights
   - [x] `collate_task_s`: Dynamic K alignment, posterior integration
   - [x] `collate_task_c`: LLM input preparation
-- [x] **Metrics** (`dr_qformer/metrics.py`)
+- [x] **Metrics** (`src/metrics.py`)
   - [x] Entailment: Precision, Recall, F1, Accuracy
   - [x] Ranking: NDCG@k, MRR, MAP, Spearman, Kendall
 - [x] **Attention Analysis Tools**
@@ -858,18 +868,19 @@ from dr_qformer.losses import (
 ### ⚠️ Partially Complete (Needs Real Model Integration)
 
 #### Frozen Model Adapters
-- [ ] **Embedding Model Adapter** (`dr_qformer/adapters/embedding.py`) - 0%
-  - [ ] **TODO (Priority 0)**: Integrate Qwen3-Embedding-4B
+- [ ] **Embedding Model Adapter** (`src/adapters/embedding.py`) - **0% (Not Started)**
+  - [ ] **TODO (Priority 0 - CRITICAL)**: Create embedding adapter for Qwen3-Embedding-4B
   - [ ] **TODO**: Unified query + evidence embedding interface
   - [ ] **CRITICAL**: Must use same embedding source for both to ensure convergence
+  - [ ] **Current Status**: No embedding adapter exists - currently using mock/placeholder in tests
   
-- [x] **Retriever Adapter** (`dr_qformer/adapters/retriever.py`) - 50%
+- [x] **Retriever Adapter** (`src/adapters/retriever.py`) - 50%
   - [x] Base interface defined
   - [x] Mock retriever for testing
   - [ ] **TODO**: Real retriever integration (Contriever/DPR/BGE)
   - [ ] **TODO**: FAISS index building and search
   
-- [x] **LLM Adapter** (`dr_qformer/adapters/llm.py`) - 60%
+- [x] **LLM Adapter** (`src/adapters/llm.py`) - 60%
   - [x] Detailed placeholder with step-by-step implementation guide
   - [x] `teacher_forcing_dual_path()` interface fully specified
   - [x] Prefix-LM mask + Qwen chat template logic documented
